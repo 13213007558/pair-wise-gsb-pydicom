@@ -1,0 +1,2 @@
+        out += b"SQ\x00\x00" + struct.pack(endian + "I", len(body))
+            raise DicomError(f"expected item tag, got {tag}")

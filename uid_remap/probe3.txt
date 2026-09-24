@@ -1,0 +1,6 @@
+def _read_element(reader, tag):
+    if reader.implicit:
+        vr = IMPLICIT_VR_HINTS.get(tag)
+        length = reader.u32()
+    else:
+        vr = reader.take(2).decode("ascii")

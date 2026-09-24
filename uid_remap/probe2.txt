@@ -1,0 +1,2 @@
+line with "quotes" and \x00 escapes
+another \ backslash
