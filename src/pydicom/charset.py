@@ -5,13 +5,21 @@ import codecs
 import re
 from typing import (
     TYPE_CHECKING,
+    Any,
+    NamedTuple,
     cast,
 )
 from collections.abc import MutableSequence, Sequence
 
 from pydicom import config
 from pydicom.misc import warn_and_log
-from pydicom.valuerep import TEXT_VR_DELIMS, PersonName, VR, CUSTOMIZABLE_CHARSET_VR
+from pydicom.valuerep import (
+    TEXT_VR_DELIMS,
+    PersonName,
+    VR,
+    CUSTOMIZABLE_CHARSET_VR,
+    _encode_personname,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from pydicom.dataelem import DataElement
@@ -838,3 +846,246 @@ def decode_element(
                     output.append(decode_bytes(value, encodings, TEXT_VR_DELIMS))
 
             elem.value = output
+
+
+class CharacterSetReplacement(NamedTuple):
+    """Information about a single character replacement performed during
+    character set conversion with `errors='replace'`.
+    """
+
+    path: str
+    """The path of the element containing the replaced character, e.g.
+    '(0008,1110)[0].(0010,0010)' for an element in the first item of a
+    sequence."""
+    value_index: int
+    """The index of the value within the element (0 for elements with
+    VM 1)."""
+    position: int
+    """The index of the replaced character within the string value."""
+    character: str
+    """The original character that has been replaced."""
+
+
+def can_encode_string(value: str, encodings: Sequence[str]) -> bool:
+    """Return `True` if `value` can be encoded using `encodings`.
+
+    Takes code extension escape sequences into account: a value that cannot
+    be encoded with a single encoding may still be encodable by switching
+    between the given encodings.
+
+    Parameters
+    ----------
+    value : str
+        The unicode string to check.
+    encodings : list of str
+        The encodings as a list of Python encodings, converted from the
+        encodings in (0008,0005) *Specific Character Set*.
+
+    Returns
+    -------
+    bool
+        `True` if `value` can be encoded with the given encodings,
+        `False` otherwise.
+    """
+    for encoding in encodings:
+        try:
+            _encode_string_impl(value, encoding)
+            return True
+        except UnicodeError:
+            continue
+
+    if len(encodings) > 1:
+        try:
+            _encode_string_parts(value, encodings)
+            return True
+        except ValueError:
+            pass
+
+    return False
+
+
+def replace_unencodable_characters(
+    value: str, encodings: Sequence[str]
+) -> tuple[str, list[int]]:
+    """Replace characters in `value` that cannot be encoded with any of
+    `encodings` with '?'.
+
+    Parameters
+    ----------
+    value : str
+        The unicode string to convert.
+    encodings : list of str
+        The encodings as a list of Python encodings, converted from the
+        encodings in (0008,0005) *Specific Character Set*.
+
+    Returns
+    -------
+    tuple[str, list[int]]
+        The converted string, and the positions of the replaced characters
+        in the original string.
+    """
+    positions = [
+        index
+        for index, char in enumerate(value)
+        if not _can_encode_char(char, encodings)
+    ]
+    if not positions:
+        return value, []
+
+    chars = list(value)
+    for index in positions:
+        chars[index] = "?"
+
+    return "".join(chars), positions
+
+
+def _can_encode_char(char: str, encodings: Sequence[str]) -> bool:
+    """Return True if the single character can be encoded with any of the
+    given encodings."""
+    for encoding in encodings:
+        try:
+            _encode_string_impl(char, encoding)
+            return True
+        except UnicodeError:
+            continue
+
+    return False
+
+
+def convert_element_charset(
+    elem: "DataElement",
+    current_encodings: Sequence[str],
+    target_encodings: Sequence[str],
+    errors: str = "strict",
+) -> tuple[Any, list[tuple[int, int, str]]]:
+    """Convert the text value of `elem` to `target_encodings`.
+
+    Parameters
+    ----------
+    elem : DataElement
+        The element with a VR of PN, LO, LT, SH, ST, UC or UT whose value
+        shall be converted.
+    current_encodings : Sequence[str]
+        The Python encodings the current value is encoded with, used to
+        decode byte string values.
+    target_encodings : Sequence[str]
+        The Python encodings corresponding to the target character set.
+    errors : str
+        If 'strict', raise a UnicodeEncodeError if a character cannot be
+        encoded with the target encodings. If 'replace', such characters
+        are replaced with '?'.
+
+    Returns
+    -------
+    tuple
+        The converted value (str, PersonName or a list of these for
+        multi-valued elements), and a list of replacements as
+        (value index, character position, original character) tuples.
+
+    Raises
+    ------
+    UnicodeEncodeError
+        If `errors` is 'strict' and a character of the value cannot be
+        encoded with `target_encodings`.
+    """
+    if elem.VM == 1:
+        values = [elem.value]
+    else:
+        values = list(elem.value)
+
+    replacements: list[tuple[int, int, str]] = []
+    new_values = []
+    for index, value in enumerate(values):
+        converted: tuple[Any, list[tuple[int, str]]]
+        if elem.VR == VR.PN:
+            converted = _convert_pn_charset(
+                value, current_encodings, target_encodings, errors
+            )
+        else:
+            converted = _convert_text_charset(
+                value, current_encodings, target_encodings, errors
+            )
+        new_value, replaced = converted
+        replacements.extend((index, position, char) for position, char in replaced)
+        new_values.append(new_value)
+
+    if elem.VM == 1:
+        return new_values[0], replacements
+
+    return new_values, replacements
+
+
+def _convert_text_charset(
+    value: str | bytes,
+    current_encodings: Sequence[str],
+    target_encodings: Sequence[str],
+    errors: str,
+) -> tuple[str, list[tuple[int, str]]]:
+    """Convert a single text value to the target encodings.
+
+    Returns the converted string and a list of (position, character)
+    tuples for replaced characters.
+    """
+    if isinstance(value, bytes):
+        value = decode_bytes(value, current_encodings, TEXT_VR_DELIMS)
+
+    if errors == "strict":
+        if not can_encode_string(value, target_encodings):
+            index = next(
+                i
+                for i, char in enumerate(value)
+                if not _can_encode_char(char, target_encodings)
+            )
+            raise UnicodeEncodeError(
+                target_encodings[0],
+                value,
+                index,
+                index + 1,
+                "character cannot be encoded with the target character set",
+            )
+        return value, []
+
+    new_value, positions = replace_unencodable_characters(value, target_encodings)
+    return new_value, [(position, value[position]) for position in positions]
+
+
+def _convert_pn_charset(
+    value: "PersonName | str | bytes",
+    current_encodings: Sequence[str],
+    target_encodings: Sequence[str],
+    errors: str,
+) -> tuple["PersonName", list[tuple[int, str]]]:
+    """Convert a person name value to the target encodings.
+
+    The alphabetic, ideographic and phonetic component groups separated
+    by '=' are converted individually, the components within each group
+    keep their '^' separators. The returned PersonName has its encodings
+    set to the target encodings and its cached original byte string
+    updated to the re-encoded value.
+
+    Returns the converted PersonName and a list of (position, character)
+    tuples for replaced characters, where the position refers to the
+    string representation of the person name.
+    """
+    if isinstance(value, bytes | str):
+        value = PersonName(value, current_encodings)
+
+    components = value.components
+    new_groups = []
+    replacements: list[tuple[int, str]] = []
+    offset = 0
+    for group in components:
+        new_group, replaced = _convert_text_charset(
+            group, current_encodings, target_encodings, errors
+        )
+        replacements.extend((offset + position, char) for position, char in replaced)
+        new_groups.append(new_group)
+        offset += len(group) + 1  # + 1 for the '=' separator
+
+    encoded = _encode_personname(new_groups, target_encodings)
+    new_value = PersonName(
+        "=".join(new_groups),
+        encodings=target_encodings,
+        original_string=encoded,
+    )
+    return new_value, replacements

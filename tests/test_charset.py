@@ -4,8 +4,9 @@
 import pytest
 
 import pydicom.charset
-from pydicom import dcmread
+from pydicom import dcmread, dcmwrite
 from pydicom.data import get_charset_files, get_testdata_file
+from pydicom.dataset import Dataset
 from pydicom.dataelem import DataElement
 from pydicom.filebase import DicomBytesIO
 from pydicom.valuerep import PersonName
@@ -537,3 +538,219 @@ class TestCharset:
         ):
             encoded = pydicom.charset.encode_string("あaｱア", ["shift_jis"])
             assert b"?a??" == encoded
+
+
+class TestConvertCharacterSet:
+    """Tests for Dataset.convert_character_set()."""
+
+    @staticmethod
+    def _write_and_read(ds):
+        fp = DicomBytesIO()
+        dcmwrite(fp, ds)
+        fp.seek(0)
+        return dcmread(fp, force=True)
+
+    @staticmethod
+    def _written_bytes(ds):
+        fp = DicomBytesIO()
+        dcmwrite(fp, ds)
+        return fp.getvalue()
+
+    def test_convert_to_utf8_roundtrip(self):
+        """Chinese name in GB18030 is converted to UTF-8."""
+        ds = Dataset()
+        ds.SpecificCharacterSet = "GB18030"
+        ds.PatientName = "Wang^XiaoDong=王^小东"
+        ds.PatientID = "12345"
+        ds.set_original_encoding(False, True)
+        ds = self._write_and_read(ds)
+
+        replacements = ds.convert_character_set("ISO_IR 192")
+
+        assert replacements == []
+        assert ds.PatientName == "Wang^XiaoDong=王^小东"
+        assert ds.SpecificCharacterSet == "ISO_IR 192"
+        assert ds.original_character_set == ["UTF8"]
+        assert ds.is_original_encoding
+        # the cached original byte string has been converted as well
+        assert ds.PatientName.original_string == (
+            b"Wang^XiaoDong=\xe7\x8e\x8b^\xe5\xb0\x8f\xe4\xb8\x9c"
+        )
+        # the written bytes use the new character set
+        assert b"\xe7\x8e\x8b^\xe5\xb0\x8f\xe4\xb8\x9c" in self._written_bytes(ds)
+
+        ds_out = self._write_and_read(ds)
+        assert ds_out.PatientName == "Wang^XiaoDong=王^小东"
+        assert ds_out.PatientID == "12345"
+
+    def test_convert_multi_value_text(self):
+        """Multi-valued text elements are converted value by value."""
+        ds = Dataset()
+        ds.SpecificCharacterSet = "GB18030"
+        ds.add_new(0x00102154, "SH", ["患者A", "患者B", "plain"])
+        ds.set_original_encoding(False, True)
+        ds = self._write_and_read(ds)
+
+        ds.convert_character_set("ISO_IR 192")
+
+        assert list(ds[0x00102154].value) == ["患者A", "患者B", "plain"]
+        ds_out = self._write_and_read(ds)
+        assert list(ds_out[0x00102154].value) == ["患者A", "患者B", "plain"]
+
+    def test_convert_iso2022_japanese_roundtrip(self):
+        """Japanese name with ISO 2022 code extension switching."""
+        ds = Dataset()
+        ds.SpecificCharacterSet = ["ISO 2022 IR 6", "ISO 2022 IR 87"]
+        ds.PatientName = "Yamada^Tarou=山田^太郎=やまだ^たろう"
+        ds.set_original_encoding(False, True)
+        assert b"\x1b$B" in self._written_bytes(ds)
+        ds = self._write_and_read(ds)
+        assert ds.PatientName == "Yamada^Tarou=山田^太郎=やまだ^たろう"
+
+        ds.convert_character_set("ISO_IR 192")
+        assert ds.PatientName == "Yamada^Tarou=山田^太郎=やまだ^たろう"
+        ds = self._write_and_read(ds)
+        assert ds.PatientName == "Yamada^Tarou=山田^太郎=やまだ^たろう"
+
+        # convert back to ISO 2022 - escape sequences are used again
+        ds.convert_character_set(["ISO 2022 IR 6", "ISO 2022 IR 87"])
+        written = self._written_bytes(ds)
+        assert b"\x1b$B" in written
+        assert b"\x1b(B" in written
+        assert ds.PatientName.original_string == (
+            b"Yamada^Tarou=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B"
+            b"=\x1b$B$d$^$@\x1b(B^\x1b$B$?$m$&\x1b(B"
+        )
+        ds = self._write_and_read(ds)
+        assert ds.PatientName == "Yamada^Tarou=山田^太郎=やまだ^たろう"
+
+    def test_convert_sequence_local_character_set(self):
+        """SQ items with local character set and inherited character set."""
+        ds = Dataset()
+        ds.SpecificCharacterSet = "ISO_IR 192"
+        ds.PatientName = "Wang^XiaoDong=王^小东"
+        item_local = Dataset()
+        item_local.SpecificCharacterSet = ["ISO 2022 IR 6", "ISO 2022 IR 87"]
+        item_local.PatientName = "Yamada^Tarou=山田^太郎=やまだ^たろう"
+        item_inherited = Dataset()
+        item_inherited.PatientName = "Mori^Ogai=森^鷗外"
+        ds.add_new(0x00081110, "SQ", [item_local, item_inherited])
+        ds.set_original_encoding(False, True)
+        ds = self._write_and_read(ds)
+
+        ds.convert_character_set("GB18030")
+
+        seq = ds[0x00081110].value
+        assert ds.SpecificCharacterSet == "GB18030"
+        # the local override is updated to the target character set
+        assert seq[0].SpecificCharacterSet == "GB18030"
+        # the inheriting item has no own Specific Character Set
+        assert 0x00080005 not in seq[1]
+        assert seq[1]._character_set == ["GB18030"]
+        assert seq[0].PatientName == "Yamada^Tarou=山田^太郎=やまだ^たろう"
+        assert seq[1].PatientName == "Mori^Ogai=森^鷗外"
+
+        ds_out = self._write_and_read(ds)
+        seq = ds_out[0x00081110].value
+        assert ds_out.PatientName == "Wang^XiaoDong=王^小东"
+        assert seq[0].PatientName == "Yamada^Tarou=山田^太郎=やまだ^たろう"
+        assert seq[1].PatientName == "Mori^Ogai=森^鷗外"
+
+    def test_convert_strict_failure_leaves_dataset_unchanged(self):
+        """Strict mode reports all paths and does not modify the dataset."""
+        ds = Dataset()
+        ds.SpecificCharacterSet = "ISO_IR 192"
+        ds.PatientName = "Wang^XiaoDong=王^小东"
+        item = Dataset()
+        item.PatientName = "山田^太郎"
+        ds.add_new(0x00081110, "SQ", [item])
+
+        with pytest.raises(ValueError) as excinfo:
+            ds.convert_character_set("ISO_IR 100")
+
+        msg = str(excinfo.value)
+        assert "(0010,0010)" in msg
+        assert "(0008,1110)[0].(0010,0010)" in msg
+        # the dataset is unchanged
+        assert ds.PatientName == "Wang^XiaoDong=王^小东"
+        assert ds.SpecificCharacterSet == "ISO_IR 192"
+        assert ds[0x00081110][0].PatientName == "山田^太郎"
+        assert 0x00080005 not in ds[0x00081110][0]
+
+    def test_convert_replace_returns_replacements(self):
+        """Replace mode replaces unencodable characters and reports them."""
+        ds = Dataset()
+        ds.SpecificCharacterSet = "ISO_IR 192"
+        ds.PatientName = "Wang^XiaoDong=王^小东"
+        ds.add_new(0x00102154, "SH", ["患者A", "患者B"])
+        item = Dataset()
+        item.PatientName = "山田^太郎"
+        ds.add_new(0x00081110, "SQ", [item])
+        ds.set_original_encoding(False, True)
+
+        replacements = ds.convert_character_set("ISO_IR 100", errors="replace")
+
+        assert ds.PatientName == "Wang^XiaoDong=?^??"
+        assert list(ds[0x00102154].value) == ["??A", "??B"]
+        assert ds[0x00081110][0].PatientName == "??^??"
+
+        pn_replacements = [r for r in replacements if r.path == "(0010,0010)"]
+        assert [(r.value_index, r.position, r.character) for r in pn_replacements] == [
+            (0, 14, "王"),
+            (0, 16, "小"),
+            (0, 17, "东"),
+        ]
+        sh_replacements = [r for r in replacements if r.path == "(0010,2154)"]
+        assert [(r.value_index, r.position) for r in sh_replacements] == [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+        ]
+        assert any(
+            r.path == "(0008,1110)[0].(0010,0010)" and r.character == "山"
+            for r in replacements
+        )
+
+        # the converted dataset can be written and read back
+        ds_out = self._write_and_read(ds)
+        assert ds_out.PatientName == "Wang^XiaoDong=?^??"
+
+    def test_convert_ignores_non_text_values(self):
+        """Numeric, binary and default charset values are not converted."""
+        ds = Dataset()
+        ds.SpecificCharacterSet = "ISO_IR 192"
+        ds.PatientName = "王^小东"
+        ds.PatientAge = "050Y"
+        ds.Rows = 512
+        ds.add_new(0x00101030, "DS", "70.5")
+        ds.add_new(0x7FE00010, "OB", b"\x00\x01\x02\x03")
+        ds.set_original_encoding(False, True)
+
+        ds.convert_character_set("ISO_IR 100", errors="replace")
+
+        assert ds.PatientAge == "050Y"
+        assert ds.Rows == 512
+        assert ds[0x00101030].value == 70.5
+        assert ds[0x7FE00010].value == b"\x00\x01\x02\x03"
+
+    def test_convert_adds_specific_character_set(self):
+        """Specific Character Set is added if not present."""
+        ds = Dataset()
+        ds.PatientName = "Doe^John"
+        ds.set_original_encoding(False, True)
+
+        ds.convert_character_set("ISO_IR 192")
+
+        assert ds.SpecificCharacterSet == "ISO_IR 192"
+        assert ds.original_character_set == ["UTF8"]
+        ds_out = self._write_and_read(ds)
+        assert ds_out.PatientName == "Doe^John"
+        assert ds_out.SpecificCharacterSet == "ISO_IR 192"
+
+    def test_convert_invalid_errors_value(self):
+        """An invalid errors value raises a ValueError."""
+        ds = Dataset()
+        ds.PatientName = "Doe^John"
+        with pytest.raises(ValueError, match="'errors' must be"):
+            ds.convert_character_set("ISO_IR 192", errors="ignore")

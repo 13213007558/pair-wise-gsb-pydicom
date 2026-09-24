@@ -55,7 +55,12 @@ except ImportError:
 import pydicom  # for dcmwrite
 from pydicom import jsonrep, config
 from pydicom._version import __version_info__
-from pydicom.charset import default_encoding, convert_encodings
+from pydicom.charset import (
+    CharacterSetReplacement,
+    convert_element_charset,
+    default_encoding,
+    convert_encodings,
+)
 from pydicom.config import logger
 from pydicom.datadict import (
     dictionary_description,
@@ -77,7 +82,7 @@ from pydicom.pixels.utils import (
 )
 from pydicom.tag import Tag, BaseTag, TagType, TAG_PIXREP
 from pydicom.uid import PYDICOM_IMPLEMENTATION_UID, UID
-from pydicom.valuerep import VR as VR_, AMBIGUOUS_VR
+from pydicom.valuerep import VR as VR_, AMBIGUOUS_VR, CUSTOMIZABLE_CHARSET_VR
 from pydicom.waveforms import numpy_handler as wave_handler
 
 
@@ -637,6 +642,121 @@ class Dataset:  # noqa: PLW1641
                 decode_data_element(data_element, dicom_character_set)
 
         self.walk(decode_callback, recursive=False)
+
+    def convert_character_set(
+        self,
+        target_charset: str | MutableSequence[str],
+        errors: str = "strict",
+    ) -> list[CharacterSetReplacement]:
+        """Convert all text values in the dataset to the given character set.
+
+        All elements with a VR of LO, LT, PN, SH, ST, UC and UT are
+        converted to `target_charset`, both in the top-level dataset and
+        recursively in all sequence items, taking the character set
+        inheritance and local (0008,0005) *Specific Character Set* overrides
+        in sequence items into account. Numeric and binary VRs and values
+        not affected by the character set are left unchanged.
+
+        On successful conversion, (0008,0005) *Specific Character Set* is
+        set to `target_charset` in the top-level dataset and in all
+        sequence items that define their own character set, the decoded
+        values, the cached original byte strings of
+        :class:`~pydicom.valuerep.PersonName` values and the original
+        character set markers are updated, so that the dataset is written
+        with the new character set.
+
+        .. versionadded:: 3.1
+
+        Parameters
+        ----------
+        target_charset : str | list of str
+            The target character set as a value (or list of values for code
+            extensions) of (0008,0005) *Specific Character Set*, e.g.
+            "ISO_IR 192" for UTF-8.
+        errors : str, optional
+            The handling of characters that cannot be encoded with the
+            target character set. If "strict" (default), a ValueError is
+            raised naming the paths of all affected elements, and the
+            dataset is left unchanged. If "replace", such characters are
+            replaced with "?".
+
+        Returns
+        -------
+        list of pydicom.charset.CharacterSetReplacement
+            A list of all character replacements performed with
+            errors="replace", including the element path, the index of
+            the value within the element, the position of the replaced
+            character within the value and the original character. Empty
+            if no replacements were necessary or errors="strict".
+
+        Raises
+        ------
+        ValueError
+            If `errors` is "strict" and at least one element contains
+            characters that cannot be encoded with `target_charset`. The
+            exception message contains the full path of each affected
+            element, e.g. "(0008,1110)[0].(0010,0010)" for an element in
+            the first item of a sequence. The dataset is not modified in
+            this case.
+        """
+        if errors not in ("strict", "replace"):
+            raise ValueError(f"'errors' must be 'strict' or 'replace', got '{errors}'")
+
+        py_encodings = convert_encodings(target_charset)
+        charset_value: str | list[str] = (
+            target_charset if isinstance(target_charset, str) else list(target_charset)
+        )
+
+        replacements: list[CharacterSetReplacement] = []
+        failures: list[str] = []
+        # (dataset, update Specific Character Set, [(element, new value)])
+        plan: list[tuple[Dataset, bool, list[tuple[DataElement, Any]]]] = []
+
+        def visit(ds: "Dataset", path: str, is_top_level: bool) -> None:
+            current_encodings = convert_encodings(ds._character_set)
+            actions: list[tuple[DataElement, Any]] = []
+            plan.append((ds, is_top_level or 0x00080005 in ds, actions))
+            for tag in sorted(ds.keys()):
+                elem = ds[tag]
+                elem_path = f"{path}({tag.group:04X},{tag.element:04X})"
+                if elem.VR == VR_.SQ:
+                    for index, item in enumerate(elem.value):
+                        visit(item, f"{elem_path}[{index}].", False)
+                elif elem.VR in CUSTOMIZABLE_CHARSET_VR and not elem.is_empty:
+                    try:
+                        new_value, replaced = convert_element_charset(
+                            elem, current_encodings, py_encodings, errors
+                        )
+                    except UnicodeEncodeError as exc:
+                        failures.append(f"{elem_path}: {exc.object!r}")
+                        continue
+                    actions.append((elem, new_value))
+                    replacements.extend(
+                        CharacterSetReplacement(elem_path, value_index, position, char)
+                        for value_index, position, char in replaced
+                    )
+
+        visit(self, "", True)
+
+        if failures:
+            raise ValueError(
+                "Cannot convert the dataset to character set "
+                f"{charset_value!r}: the following elements contain "
+                "characters that cannot be encoded:\n  " + "\n  ".join(failures)
+            )
+
+        for ds, update_charset, actions in plan:
+            for elem, new_value in actions:
+                elem.value = new_value
+            if update_charset:
+                if 0x00080005 in ds:
+                    ds[0x00080005].value = charset_value
+                else:
+                    ds.add_new(0x00080005, "CS", charset_value)
+            ds._read_charset = py_encodings
+            ds._parent_encoding = py_encodings
+
+        return replacements
 
     def copy(self) -> "Dataset":
         """Return a shallow copy of the dataset."""
