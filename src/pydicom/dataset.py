@@ -2570,6 +2570,24 @@ class Dataset:  # noqa: PLW1641
 
         self.walk(remove_callback)
 
+    def signature_edit_plan(self) -> "SignatureEditPlan":
+        """Return a signature-aware edit plan for this dataset.
+
+        The plan stages changes first, lists which digital signatures they
+        would invalidate, and can either reject the edit or remove the
+        affected signatures before applying the changes. See
+        :mod:`pydicom.signature` for details.
+
+        Returns
+        -------
+        SignatureEditPlan
+            A new :class:`~pydicom.signature.SignatureEditPlan` bound to
+            this dataset.
+        """
+        from pydicom.signature import SignatureEditPlan
+
+        return SignatureEditPlan(self)
+
     def save_as(
         self,
         filename: str | os.PathLike[AnyStr] | BinaryIO | WriteableBuffer,
