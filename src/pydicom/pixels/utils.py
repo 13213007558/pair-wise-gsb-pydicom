@@ -1,13 +1,15 @@
 # Copyright 2008-2024 pydicom authors. See LICENSE file for details.
 """Utilities for pixel data handling."""
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 try:
     from collections.abc import Buffer  # type: ignore[attr-defined]
 except ImportError:
     from collections.abc import ByteString as Buffer  # Python 3.10, 3.11
+import copy
 import math
+import operator
 import importlib
 import logging
 from pathlib import Path
@@ -25,7 +27,13 @@ except ImportError:
 
 from pydicom.charset import default_encoding
 from pydicom._dicom_dict import DicomDictionary
-from pydicom.encaps import encapsulate, encapsulate_extended
+from pydicom.encaps import (
+    encapsulate,
+    encapsulate_extended,
+    generate_fragmented_frames,
+    itemize_fragment,
+    parse_basic_offsets,
+)
 from pydicom.misc import warn_and_log
 from pydicom.tag import BaseTag
 from pydicom.uid import (
@@ -2444,3 +2452,352 @@ def concatenate_packed_frames(
             )
 
     return cast(bytes, out_arr.tobytes())
+
+
+# Elements containing 1-based frame number references into the pixel data
+_FRAME_REFERENCE_TAGS = {
+    0x00081160,  # Referenced Frame Number
+    0x0040A136,  # Referenced Frame Numbers
+}
+
+
+def select_frames(
+    ds: "Dataset",
+    indices: Sequence[int],
+    *,
+    sop_instance_uid: "str | Callable[[Dataset, list[int]], str] | None" = None,
+) -> "Dataset":
+    """Return a new :class:`~pydicom.dataset.Dataset` containing only the
+    frames of `ds` selected by `indices`.
+
+    .. versionadded:: 3.1
+
+    This is intended for use with enhanced multi-frame objects. The original
+    dataset `ds` is left unchanged. The selection preserves the order given
+    by `indices` and may contain the same frame index more than once, for
+    example ``select_frames(ds, [4, 1, 4])`` returns a dataset with three
+    frames: the original frames 4, 1 and 4 (zero-based indexing).
+
+    The following elements are updated in the returned dataset to keep them
+    consistent with the new set of frames:
+
+    * (0028,0008) *Number of Frames* is set to the number of selected frames.
+    * (7FE0,0010) *Pixel Data* (or (7FE0,0008) *Float Pixel Data* /
+      (7FE0,0009) *Double Float Pixel Data*) contains only the selected
+      frames, in the order given by `indices`. For natively encoded data
+      with (0028,0100) *Bits Allocated* of ``1`` the bit-packed pixel data
+      is repacked so frame boundaries need not align with byte boundaries.
+      For encapsulated (compressed) data the selected frames are copied
+      without decoding and the Basic Offset Table or (7FE0,0001) *Extended
+      Offset Table* and (7FE0,0002) *Extended Offset Table Lengths* are
+      rebuilt accordingly.
+    * (5200,9230) *Per-frame Functional Groups Sequence* contains the items
+      corresponding to the selected frames, in selection order.
+    * (0008,1160) *Referenced Frame Number* and (0040,A136) *Referenced
+      Frame Numbers* values anywhere in the dataset are remapped to the new
+      frame positions. References to frames that are not selected are
+      removed; if no referenced frames remain the element is removed.
+
+    (5200,9229) *Shared Functional Groups Sequence* is copied unchanged, as
+    shared functional groups apply to all frames by definition.
+
+    Parameters
+    ----------
+    ds : pydicom.dataset.Dataset
+        The dataset to select frames from. Must contain the
+        :dcm:`Image Pixel<part03/sect_C.7.6.3.html>` module elements and,
+        for encapsulated data, a *Transfer Syntax UID* in the dataset's
+        ``file_meta``.
+    indices : sequence of int
+        The zero-based indices of the frames to select, in the order they
+        should appear in the returned dataset. Indices may be repeated to
+        include the same frame more than once.
+    sop_instance_uid : str, callable or None, optional
+        The caller's policy for the (0008,0018) *SOP Instance UID* of the
+        returned dataset. If a :class:`str` then it will be used directly.
+        If callable then it will be called with the new dataset and the list
+        of selected `indices` and should return the UID to use. If ``None``
+        (default) then the original *SOP Instance UID* is kept. When a new
+        UID is set and the dataset's ``file_meta`` contains a (0002,0002)
+        *Media Storage SOP Instance UID* it will be updated to match.
+
+    Returns
+    -------
+    pydicom.dataset.Dataset
+        A new dataset containing only the selected frames.
+
+    Raises
+    ------
+    ValueError
+        If `indices` is empty, if the *Per-frame Functional Groups
+        Sequence* doesn't contain one item per frame, or if the frame
+        boundaries of encapsulated pixel data cannot be determined reliably
+        because neither a Basic Offset Table nor an Extended Offset Table
+        is available.
+    IndexError
+        If an index in `indices` is out of range for the number of frames.
+    """
+    indices = list(indices)
+    if not indices:
+        raise ValueError("'indices' must contain at least one frame index")
+
+    validated = []
+    for index in indices:
+        try:
+            validated.append(operator.index(index))
+        except TypeError:
+            raise TypeError(
+                f"'indices' must contain integers, got {type(index).__name__}"
+            ) from None
+
+        if validated[-1] < 0:
+            raise ValueError(f"'indices' must be non-negative, got {index}")
+
+    indices = validated
+
+    nr_frames = get_nr_frames(ds, warn=False)
+    if max(indices) >= nr_frames:
+        raise IndexError(
+            f"Frame index {max(indices)} is out of range for a dataset with "
+            f"{nr_frames} frame(s)"
+        )
+
+    pixel_tag = next(
+        (tag for tag in (0x7FE00010, 0x7FE00008, 0x7FE00009) if tag in ds), None
+    )
+    if pixel_tag is None:
+        raise AttributeError(
+            "The dataset contains no (7FE0,0010) 'Pixel Data', (7FE0,0008) "
+            "'Float Pixel Data' or (7FE0,0009) 'Double Float Pixel Data' "
+            "element"
+        )
+
+    if "PerFrameFunctionalGroupsSequence" in ds:
+        nr_items = len(ds.PerFrameFunctionalGroupsSequence)
+        if nr_items != nr_frames:
+            raise ValueError(
+                "The (5200,9230) 'Per-frame Functional Groups Sequence' "
+                f"contains {nr_items} item(s) but the dataset has {nr_frames} "
+                "frame(s); the sequence must contain exactly one item per "
+                "frame"
+            )
+
+    out = copy.deepcopy(ds)
+
+    if pixel_tag == 0x7FE00010 and _is_encapsulated(ds):
+        pixel_data, eot, eot_lengths = _select_encapsulated_frames(
+            ds, indices, nr_frames
+        )
+        out[pixel_tag].value = pixel_data
+        if eot is not None:
+            out.ExtendedOffsetTable = eot
+            out.ExtendedOffsetTableLengths = eot_lengths
+        else:
+            out.pop("ExtendedOffsetTable", None)
+            out.pop("ExtendedOffsetTableLengths", None)
+    else:
+        out[pixel_tag].value = _select_native_frames(ds, indices, nr_frames)
+        out.pop("ExtendedOffsetTable", None)
+        out.pop("ExtendedOffsetTableLengths", None)
+
+    out.NumberOfFrames = str(len(indices))
+
+    if "PerFrameFunctionalGroupsSequence" in ds:
+        # Deep copy each selected item so repeated indices give independent
+        #   items in the output
+        out.PerFrameFunctionalGroupsSequence = [
+            copy.deepcopy(ds.PerFrameFunctionalGroupsSequence[index])
+            for index in indices
+        ]
+
+    # Remap 1-based frame number references to the new frame positions
+    frame_map: dict[int, list[int]] = {}
+    for new_position, old_index in enumerate(indices, start=1):
+        frame_map.setdefault(old_index, []).append(new_position)
+
+    _remap_frame_references(out, frame_map)
+
+    if sop_instance_uid is not None:
+        uid = (
+            sop_instance_uid(out, indices)
+            if callable(sop_instance_uid)
+            else str(sop_instance_uid)
+        )
+        if "SOPInstanceUID" in out:
+            out.SOPInstanceUID = uid
+
+        file_meta = getattr(out, "file_meta", None)
+        if file_meta is not None and "MediaStorageSOPInstanceUID" in file_meta:
+            file_meta.MediaStorageSOPInstanceUID = uid
+
+    return out
+
+
+def _is_encapsulated(ds: "Dataset") -> bool:
+    """Return ``True`` if `ds` uses an encapsulated (compressed) transfer
+    syntax.
+    """
+    file_meta = getattr(ds, "file_meta", None)
+    tsyntax = getattr(file_meta, "TransferSyntaxUID", None)
+
+    return tsyntax is not None and UID(tsyntax).is_compressed
+
+
+def _select_native_frames(ds: "Dataset", indices: list[int], nr_frames: int) -> bytes:
+    """Return native (uncompressed) pixel data containing only the frames
+    from `ds` given by `indices`.
+    """
+    pixel_tag = next(tag for tag in (0x7FE00010, 0x7FE00008, 0x7FE00009) if tag in ds)
+    src: bytes = ds[pixel_tag].value
+
+    frame_pixels = ds.Rows * ds.Columns * ds.SamplesPerPixel
+    bits_allocated = ds.BitsAllocated
+
+    if bits_allocated == 1:
+        # Bit-packed data: frame boundaries may fall within a byte, so the
+        #   selected frames need to be extracted and repacked bit-wise
+        frames = [
+            get_packed_frame(src, index, frame_pixels, pad=False) for index in indices
+        ]
+        return concatenate_packed_frames(frames, frame_pixels, pad=True)
+
+    frame_length = frame_pixels * (bits_allocated // 8)
+    if len(src) < nr_frames * frame_length:
+        raise ValueError(
+            f"The length of the pixel data ({len(src)} bytes) is less than "
+            f"the expected {nr_frames * frame_length} bytes for {nr_frames} "
+            "frame(s)"
+        )
+
+    out = bytearray()
+    for index in indices:
+        start = index * frame_length
+        out += src[start : start + frame_length]
+
+    # Pad to an even length as required for OB/OW VRs
+    if len(out) % 2:
+        out += b"\x00"
+
+    return bytes(out)
+
+
+def _select_encapsulated_frames(
+    ds: "Dataset", indices: list[int], nr_frames: int
+) -> tuple[bytes, "bytes | None", "bytes | None"]:
+    """Return encapsulated pixel data containing only the frames from `ds`
+    given by `indices`, copying the compressed frame data without decoding
+    it.
+
+    Returns the encapsulated pixel data and, if the original dataset used an
+    Extended Offset Table, the rebuilt (7FE0,0001) *Extended Offset Table*
+    and (7FE0,0002) *Extended Offset Table Lengths* values, otherwise
+    ``None`` for both.
+    """
+    src: bytes = ds.PixelData
+
+    extended_offsets = None
+    if "ExtendedOffsetTable" in ds and "ExtendedOffsetTableLengths" in ds:
+        extended_offsets = (ds.ExtendedOffsetTable, ds.ExtendedOffsetTableLengths)
+
+    if extended_offsets is None and not parse_basic_offsets(src):
+        raise ValueError(
+            "Unable to select frames from the encapsulated pixel data: the "
+            "frame boundaries cannot be determined reliably because neither "
+            "a Basic Offset Table nor an Extended Offset Table is available"
+        )
+
+    frames = list(
+        generate_fragmented_frames(
+            src,
+            number_of_frames=nr_frames,
+            extended_offsets=extended_offsets,
+        )
+    )
+    if len(frames) != nr_frames:
+        raise ValueError(
+            "Unable to select frames from the encapsulated pixel data: "
+            f"expected {nr_frames} frame(s) but found {len(frames)} in the "
+            "encapsulated data"
+        )
+
+    selected = [frames[index] for index in indices]
+
+    return _encapsulate_frame_selection(
+        selected, use_extended=extended_offsets is not None
+    )
+
+
+def _encapsulate_frame_selection(
+    frames: list[tuple[bytes, ...]], use_extended: bool
+) -> tuple[bytes, "bytes | None", "bytes | None"]:
+    """Return encapsulated pixel data for `frames`, preserving the original
+    fragmentation of each frame.
+
+    If `use_extended` is ``True`` then an empty Basic Offset Table is used
+    and the Extended Offset Table and Extended Offset Table Lengths values
+    are returned as well, otherwise the Basic Offset Table is populated and
+    ``None`` is returned for both.
+    """
+    body = bytearray()
+    offsets: list[int] = []
+    lengths: list[int] = []
+    for fragments in frames:
+        offsets.append(len(body))
+        frame_length = 0
+        for fragment in fragments:
+            # Fragments must be an even number of bytes
+            if len(fragment) % 2:
+                fragment += b"\x00"
+
+            item = itemize_fragment(fragment)
+            body.extend(item)
+            frame_length += len(item) - 8
+
+        lengths.append(frame_length)
+
+    if use_extended:
+        # Empty Basic Offset Table, per PS3.3 C.7.6.3.1.8
+        pixel_data = b"\xfe\xff\x00\xe0" + pack("<I", 0) + bytes(body)
+        eot = pack(f"<{len(offsets)}Q", *offsets)
+        eot_lengths = pack(f"<{len(lengths)}Q", *lengths)
+
+        return pixel_data, eot, eot_lengths
+
+    bot = (
+        b"\xfe\xff\x00\xe0"
+        + pack("<I", 4 * len(offsets))
+        + pack(f"<{len(offsets)}I", *offsets)
+    )
+
+    return bytes(bot + body), None, None
+
+
+def _remap_frame_references(ds: "Dataset", frame_map: dict[int, list[int]]) -> None:
+    """Remap 1-based frame number references in `ds` (in-place) using
+    `frame_map`, which maps the original zero-based frame index to a list of
+    the new 1-based frame positions.
+
+    Referenced frames that have no corresponding frame in `frame_map` are
+    removed; elements left without any referenced frame are deleted.
+    """
+    empty_tags = []
+    for elem in ds:
+        if elem.tag in _FRAME_REFERENCE_TAGS:
+            if elem.value is None:
+                continue
+
+            values = list(elem.value) if elem.VM > 1 else [elem.value]
+            new_values = []
+            for value in values:
+                new_values.extend(frame_map.get(int(value) - 1, []))
+
+            if new_values:
+                elem.value = new_values if len(new_values) > 1 else new_values[0]
+            else:
+                empty_tags.append(elem.tag)
+        elif elem.VR == "SQ":
+            for item in elem.value:
+                _remap_frame_references(item, frame_map)
+
+    for tag in empty_tags:
+        del ds[tag]

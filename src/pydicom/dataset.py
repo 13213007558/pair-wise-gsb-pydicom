@@ -29,6 +29,7 @@ from collections.abc import (
     Callable,
     MutableSequence,
     MutableMapping,
+    Sequence,
     Set,
 )
 from contextlib import nullcontext
@@ -69,7 +70,13 @@ from pydicom.dataelem import DataElement, convert_raw_data_element, RawDataEleme
 from pydicom.filebase import ReadableBuffer, WriteableBuffer
 from pydicom.fileutil import path_from_pathlike, PathType
 from pydicom.misc import warn_and_log, find_keyword_candidates
-from pydicom.pixels import compress, convert_color_space, decompress, pixel_array
+from pydicom.pixels import (
+    compress,
+    convert_color_space,
+    decompress,
+    pixel_array,
+    select_frames,
+)
 from pydicom.pixels.utils import (
     reshape_pixel_array,
     get_image_pixel_ids,
@@ -2149,6 +2156,54 @@ class Dataset:  # noqa: PLW1641
             generate_instance_uid=generate_instance_uid,
             **opts,
         )
+
+    def select_frames(
+        self,
+        indices: Sequence[int],
+        *,
+        sop_instance_uid: "str | Callable[[Dataset, list[int]], str] | None" = None,
+    ) -> "Dataset":
+        """Return a new Dataset containing only the frames selected by
+        ``indices``.
+
+        .. versionadded:: 3.1
+
+        This is intended for use with enhanced multi-frame objects. The
+        original dataset is left unchanged. The selection preserves the
+        order given by ``indices`` and may contain the same frame index
+        more than once, for example ``ds.select_frames([4, 1, 4])``
+        returns a dataset with three frames: the original frames 4, 1
+        and 4 (zero-based indexing).
+
+        The (0028,0008) *Number of Frames*, (7FE0,0010) *Pixel Data*,
+        (5200,9230) *Per-frame Functional Groups Sequence* and any
+        (0008,1160) *Referenced Frame Number* or (0040,A136) *Referenced
+        Frame Numbers* values in the returned dataset are updated to
+        correspond to the selected frames. Encapsulated (compressed)
+        frames are copied without being decoded and the Basic or
+        Extended Offset Table is rebuilt accordingly. See
+        :func:`~pydicom.pixels.utils.select_frames` for details.
+
+        Parameters
+        ----------
+        indices : sequence of int
+            The zero-based indices of the frames to select, in the order
+            they should appear in the returned dataset. Indices may be
+            repeated to include the same frame more than once.
+        sop_instance_uid : str, callable or None, optional
+            The caller's policy for the (0008,0018) *SOP Instance UID*
+            of the returned dataset. If a str then it will be used
+            directly. If callable then it will be called with the new
+            dataset and the list of selected ``indices`` and should
+            return the UID to use. If ``None`` (default) then the
+            original *SOP Instance UID* is kept.
+
+        Returns
+        -------
+        Dataset
+            A new dataset containing only the selected frames.
+        """
+        return select_frames(self, indices, sop_instance_uid=sop_instance_uid)
 
     def overlay_array(self, group: int) -> "numpy.ndarray":
         """Return the *Overlay Data* in `group` as a :class:`numpy.ndarray`.

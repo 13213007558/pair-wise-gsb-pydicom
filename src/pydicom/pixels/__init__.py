@@ -23,6 +23,7 @@ from pydicom.pixels.utils import (
     get_packed_frame,
     pack_bits,
     pixel_array,
+    select_frames,
     set_pixel_data,
     unpack_bits,
 )
