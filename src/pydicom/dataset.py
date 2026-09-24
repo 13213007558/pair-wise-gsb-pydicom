@@ -20,6 +20,7 @@ import io
 import json
 import os
 import os.path
+import codecs
 from pathlib import Path
 import re
 from bisect import bisect_left
@@ -45,6 +46,7 @@ from typing import (
     BinaryIO,
     TypeVar,
     overload,
+    NamedTuple,
 )
 
 try:
@@ -55,7 +57,14 @@ except ImportError:
 import pydicom  # for dcmwrite
 from pydicom import jsonrep, config
 from pydicom._version import __version_info__
-from pydicom.charset import default_encoding, convert_encodings
+from pydicom.charset import (
+    default_encoding,
+    convert_encodings,
+    decode_bytes,
+    encode_string_strict,
+    python_encoding,
+    unencodable_positions,
+)
 from pydicom.config import logger
 from pydicom.datadict import (
     dictionary_description,
@@ -77,7 +86,13 @@ from pydicom.pixels.utils import (
 )
 from pydicom.tag import Tag, BaseTag, TagType, TAG_PIXREP
 from pydicom.uid import PYDICOM_IMPLEMENTATION_UID, UID
-from pydicom.valuerep import VR as VR_, AMBIGUOUS_VR
+from pydicom.valuerep import (
+    VR as VR_,
+    AMBIGUOUS_VR,
+    CUSTOMIZABLE_CHARSET_VR,
+    TEXT_VR_DELIMS,
+    PersonName,
+)
 from pydicom.waveforms import numpy_handler as wave_handler
 
 
@@ -238,6 +253,188 @@ def _dict_equal(a: "Dataset", b: Any, exclude: list[str] | None = None) -> bool:
 
 _DatasetValue = DataElement | RawDataElement
 _DatasetType: TypeAlias = "Dataset | MutableMapping[BaseTag, _DatasetValue]"
+
+
+class CharsetReplacement(NamedTuple):
+    """Information about a text value where characters not encodable in
+    the target character set have been replaced during
+    :meth:`Dataset.convert_character_set` with ``errors='replace'``.
+    """
+
+    path: str
+    """The path to the element containing the replaced characters, e.g.
+    ``'(0010,0010)'`` for a top-level element or
+    ``'(0008,1110)[0] > (0010,0010)'`` for an element in the first item of
+    a sequence."""
+    value_index: int
+    """The index of the value within the element value (0 for elements
+    with a VM of 1)."""
+    positions: list[int]
+    """The indices of the replaced characters within the decoded string
+    value."""
+    replaced: str
+    """The original characters that have been replaced."""
+
+
+class _CharsetConverter:
+    """Convert the text values of a dataset to a new character set.
+
+    Used by :meth:`Dataset.convert_character_set`. All changes are
+    collected without applying them, so that the dataset is left
+    unmodified if a value cannot be converted in strict mode.
+    """
+
+    def __init__(
+        self,
+        target_encodings: list[str],
+        charset_value: "str | list[str]",
+        errors: str,
+    ) -> None:
+        self.target_encodings = target_encodings
+        self.charset_value = charset_value
+        self.errors = errors
+        # (path, value index, positions, replaced characters)
+        self.failures: list[tuple[str, int, list[int], str]] = []
+        self.replacements: list[CharsetReplacement] = []
+        # deferred changes, applied only if the whole conversion succeeds
+        self.mutations: list[Callable[[], None]] = []
+
+    def sanitize(self, value: str) -> tuple[str, list[int]]:
+        """Return `value` with unencodable characters replaced by '?'
+        (for 'replace' mode) together with the positions of the
+        unencodable characters."""
+        bad = unencodable_positions(value, self.target_encodings)
+        if not bad or self.errors == "strict":
+            return value, bad
+        chars = list(value)
+        for i in bad:
+            chars[i] = "?"
+        return "".join(chars), bad
+
+    def record(
+        self, path: str, value_index: int, positions: list[int], replaced: str
+    ) -> None:
+        """Record a failure or replacement for the given value."""
+        if self.errors == "strict":
+            self.failures.append((path, value_index, positions, replaced))
+        else:
+            self.replacements.append(
+                CharsetReplacement(path, value_index, positions, replaced)
+            )
+
+    def convert_text_element(
+        self, elem: DataElement, path: str, current_encodings: list[str]
+    ) -> None:
+        """Convert the value of a text element (except PN)."""
+        values = [elem.value] if elem.VM == 1 else list(elem.value)
+        new_values = []
+        changed = False
+        for vi, val in enumerate(values):
+            if isinstance(val, bytes):
+                # raw value that has not been decoded yet
+                val = decode_bytes(val, current_encodings, TEXT_VR_DELIMS)
+                changed = True
+            new_val, bad = self.sanitize(val)
+            if bad:
+                self.record(path, vi, bad, "".join(val[i] for i in bad))
+                changed = True
+            new_values.append(new_val)
+        if changed:
+            new_value = new_values[0] if elem.VM == 1 else new_values
+
+            def apply(elem: DataElement = elem, new_value: Any = new_value) -> None:
+                elem.value = new_value
+
+            self.mutations.append(apply)
+
+    def convert_pn_element(
+        self, elem: DataElement, path: str, current_encodings: list[str]
+    ) -> None:
+        """Convert the value of a PN element, handling the alphabetic,
+        ideographic and phonetic component groups separately."""
+        values = [elem.value] if elem.VM == 1 else list(elem.value)
+        new_values = []
+        failed = False
+        for vi, val in enumerate(values):
+            if isinstance(val, bytes):
+                val = PersonName(val, encodings=current_encodings)
+            elif isinstance(val, str):
+                val = PersonName(val)
+            components = list(val.components)
+            new_components = []
+            offset = 0
+            value_failed = False
+            for comp in components:
+                new_comp, bad = self.sanitize(comp)
+                if bad:
+                    # positions are reported within the whole decoded
+                    # value, i.e. the components joined by '='
+                    self.record(
+                        path,
+                        vi,
+                        [offset + i for i in bad],
+                        "".join(comp[i] for i in bad),
+                    )
+                    if self.errors == "strict":
+                        value_failed = True
+                new_components.append(new_comp)
+                offset += len(comp) + 1
+            if value_failed:
+                failed = True
+                new_values.append(val)
+                continue
+            # encode each component group separately per the DICOM
+            # delimiter rules for PN values
+            encoded = b"=".join(
+                b"^".join(
+                    encode_string_strict(group, self.target_encodings)
+                    for group in comp.split("^")
+                )
+                for comp in new_components
+            )
+            new_values.append(
+                PersonName(
+                    "=".join(new_components),
+                    encodings=self.target_encodings,
+                    original_string=encoded,
+                )
+            )
+        if not failed:
+            new_value = new_values[0] if elem.VM == 1 else new_values
+
+            def apply(elem: DataElement = elem, new_value: Any = new_value) -> None:
+                elem.value = new_value
+
+            self.mutations.append(apply)
+
+    def convert_dataset(self, ds: "Dataset", path: str, is_root: bool) -> None:
+        """Collect the changes needed to convert all text values in `ds`,
+        recursing into sequence items."""
+        current = ds._character_set
+        current_encodings = [current] if isinstance(current, str) else current
+        for elem in ds:
+            if elem.VR == VR_.SQ:
+                for index, item in enumerate(elem.value):
+                    self.convert_dataset(item, f"{path}{elem.tag}[{index}] > ", False)
+            elif elem.VR in CUSTOMIZABLE_CHARSET_VR and not elem.is_empty:
+                elem_path = f"{path}{elem.tag}"
+                if elem.VR == VR_.PN:
+                    self.convert_pn_element(elem, elem_path, current_encodings)
+                else:
+                    self.convert_text_element(elem, elem_path, current_encodings)
+
+        def update_charset(ds: "Dataset" = ds, is_root: bool = is_root) -> None:
+            # the converted values of sequence items without their own
+            # (0008,0005) are inherited from the parent dataset
+            if is_root or BaseTag(0x00080005) in ds:
+                if BaseTag(0x00080005) in ds:
+                    ds[BaseTag(0x00080005)].value = self.charset_value
+                else:
+                    ds.add_new(0x00080005, "CS", self.charset_value)
+            ds._read_charset = self.target_encodings
+            ds._parent_encoding = self.target_encodings
+
+        self.mutations.append(update_charset)
 
 
 class Dataset:  # noqa: PLW1641
@@ -641,6 +838,114 @@ class Dataset:  # noqa: PLW1641
     def copy(self) -> "Dataset":
         """Return a shallow copy of the dataset."""
         return copy.copy(self)
+
+    def convert_character_set(
+        self,
+        target_charset: str | MutableSequence[str],
+        errors: str = "strict",
+    ) -> list[CharsetReplacement]:
+        """Convert the character set used for the text values in the
+        :class:`Dataset` to `target_charset`.
+
+        All elements with a VR that is affected by (0008,0005) *Specific
+        Character Set* (**LO**, **LT**, **PN**, **SH**, **ST**, **UC** and
+        **UT**) are re-encoded, recursively including elements in sequence
+        items, where the character set may be inherited from the parent
+        dataset or overridden by a local (0008,0005) *Specific Character
+        Set*. For **PN** values the alphabetic, ideographic and phonetic
+        component groups are converted separately according to the DICOM
+        delimiter rules. Elements with numeric, binary or other VRs that
+        are not affected by the character set are left unchanged.
+
+        On success, the (0008,0005) *Specific Character Set* of the dataset
+        (and of any sequence item that defines its own) is set to
+        `target_charset`, and the decoded values, the
+        :attr:`~Dataset.original_character_set` markers and the encoded
+        bytes written out afterwards are all consistent with the new
+        character set.
+
+        .. versionadded:: 3.1
+
+        Parameters
+        ----------
+        target_charset : str | list of str
+            The target character set as defined term(s) for (0008,0005)
+            *Specific Character Set*, e.g. ``'ISO_IR 192'`` for UTF-8.
+            Multiple values may be given for character sets using code
+            extensions (escape sequences), e.g.
+            ``['ISO 2022 IR 6', 'ISO 2022 IR 87']``.
+        errors : str, optional
+            The handling strategy for characters that cannot be encoded in
+            the target character set:
+
+            * ``'strict'`` (default): if any value contains a character
+              that cannot be encoded, raise a :class:`ValueError`
+              reporting the full tag and sequence item path of every
+              affected element. The dataset is left unmodified in this
+              case.
+            * ``'replace'``: replace characters that cannot be encoded
+              with ``'?'`` and return information about every replacement
+              so the result can be reviewed before being accepted.
+
+        Returns
+        -------
+        list of CharsetReplacement
+            With ``errors='replace'``, an entry for every value in which
+            characters had to be replaced, including the element path, the
+            value index and the positions of the replaced characters.
+            Empty if no replacements were necessary or with
+            ``errors='strict'``.
+
+        Raises
+        ------
+        ValueError
+            If `errors` is invalid, if `target_charset` is unknown, or
+            with ``errors='strict'`` if any character cannot be encoded
+            in the target character set.
+        """
+        if errors not in ("strict", "replace"):
+            raise ValueError(
+                f"Invalid value '{errors}' for 'errors': must be 'strict' "
+                "or 'replace'"
+            )
+
+        charset_value: str | list[str]
+        if isinstance(target_charset, str):
+            charset_value = target_charset
+            charset_terms = [target_charset]
+        else:
+            charset_value = list(target_charset)
+            charset_terms = charset_value
+
+        # validate the target character set(s) before changing anything
+        for term in charset_terms:
+            if term in python_encoding:
+                continue
+            try:
+                codecs.lookup(term)
+            except LookupError:
+                raise ValueError(f"Unknown character set '{term}'") from None
+
+        target_encodings = convert_encodings(charset_value)
+
+        converter = _CharsetConverter(target_encodings, charset_value, errors)
+        converter.convert_dataset(self, "", is_root=True)
+
+        if converter.failures:
+            details = "\n  ".join(
+                f"{path} (value {vi}): cannot encode character(s) {chars!r} "
+                f"at position(s) {positions}"
+                for path, vi, positions, chars in converter.failures
+            )
+            raise ValueError(
+                f"Cannot convert the dataset to character set {charset_value!r}:"
+                f"\n  {details}\nThe dataset has not been modified."
+            )
+
+        for mutate in converter.mutations:
+            mutate()
+
+        return converter.replacements
 
     def __delattr__(self, name: str) -> None:
         """Intercept requests to delete an attribute by `name`.

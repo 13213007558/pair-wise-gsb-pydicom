@@ -627,6 +627,101 @@ def _encode_string_impl(value: str, encoding: str, errors: str = "strict") -> by
     return value.encode(encoding, errors=errors)
 
 
+def encode_string_strict(value: str, encodings: Sequence[str]) -> bytes:
+    """Encode a unicode string `value` into :class:`bytes` using `encodings`.
+
+    Works like :func:`encode_string`, but always raises an exception if
+    `value` cannot be encoded instead of depending on
+    :attr:`~pydicom.config.settings.writing_validation_mode`.
+
+    Parameters
+    ----------
+    value : str
+        The unicode string to encode.
+    encodings : list of str
+        The encodings needed to encode the string as a list of Python
+        encodings, converted from the encodings in (0008,0005) *Specific
+        Character Set*.
+
+    Returns
+    -------
+    bytes
+        The encoded string, including the escape sequences needed to switch
+        between different encodings if more than one encoding is given.
+
+    Raises
+    ------
+    UnicodeEncodeError
+        If `value` could not be encoded with any of the given encodings.
+    """
+    if not value:
+        return b""
+
+    for i, encoding in enumerate(encodings):
+        try:
+            encoded = _encode_string_impl(value, encoding)
+
+            if i > 0 and encoding not in handled_encodings:
+                escape_sequence = _get_escape_sequence_for_encoding(
+                    encoding, encoded=encoded
+                )
+                encoded = escape_sequence + encoded
+            if encoding in need_tail_escape_sequence_encodings:
+                encoded += _get_escape_sequence_for_encoding(encodings[0])
+            return encoded
+        except UnicodeError:
+            continue
+
+    # retry encoding by splitting `value` into chunks that can each be
+    # encoded with one of the encodings
+    try:
+        return _encode_string_parts(value, encodings)
+    except ValueError:
+        pass
+
+    raise UnicodeEncodeError(
+        encodings[0],
+        value,
+        0,
+        len(value),
+        "value cannot be encoded with any of the given encodings",
+    )
+
+
+def unencodable_positions(value: str, encodings: Sequence[str]) -> list[int]:
+    """Return the indices of the characters in `value` that cannot be
+    encoded with any of the given `encodings`.
+
+    Parameters
+    ----------
+    value : str
+        The unicode string to check.
+    encodings : list of str
+        The encodings available to encode the string as a list of Python
+        encodings, converted from the encodings in (0008,0005) *Specific
+        Character Set*.
+
+    Returns
+    -------
+    list of int
+        The indices of the characters in `value` that cannot be encoded
+        with any of `encodings`. An empty list means the whole value can
+        be encoded.
+    """
+    positions = []
+    for index, char in enumerate(value):
+        for encoding in encodings:
+            try:
+                _encode_string_impl(char, encoding)
+                break
+            except UnicodeError:
+                continue
+        else:
+            positions.append(index)
+
+    return positions
+
+
 # DICOM PS3.5-2008 6.1.1 (p 18) says:
 #   default is ISO-IR 6 G0, equiv to common chr set of ISO 8859 (PS3.5 6.1.2.1)
 #    (0008,0005)  value 1 can *replace* the default encoding...
