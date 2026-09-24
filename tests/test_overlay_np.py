@@ -29,8 +29,15 @@ import pytest
 
 import pydicom
 from pydicom.data import get_testdata_file
+from pydicom.dataset import Dataset, FileMetaDataset
 from pydicom.filereader import dcmread
-from pydicom.uid import ImplicitVRLittleEndian, ExplicitVRLittleEndian
+from pydicom.pixels.utils import pack_bits, unpack_bits
+from pydicom.uid import (
+    ImplicitVRLittleEndian,
+    ExplicitVRLittleEndian,
+    ExplicitVRBigEndian,
+    JPEGBaseline8Bit,
+)
 
 try:
     import numpy as np
@@ -42,6 +49,7 @@ except ImportError:
 try:
     from pydicom.overlays import numpy_handler as NP_HANDLER
     from pydicom.overlays.numpy_handler import (
+        extract_overlay,
         get_overlay_array,
         reshape_overlay_array,
         get_expected_length,
@@ -432,3 +440,289 @@ class TestNumpy_GetExpectedLength:
         }
 
         assert length[1] == get_expected_length(elem, unit="pixels")
+
+
+@pytest.mark.skipif(not HAVE_NP, reason="Numpy is not available")
+class TestExtractOverlay:
+    """Tests for numpy_handler.extract_overlay."""
+
+    def make_ds(
+        self,
+        plane,
+        rows=6,
+        columns=6,
+        frames=1,
+        bits_allocated=16,
+        bits_stored=12,
+        pixel_representation=0,
+        tsyntax=EXPL,
+        group=0x6000,
+        origin=(1, 1),
+        bit_position=15,
+        frame_origin=1,
+        other_bits=(),
+    ):
+        """Return a dataset with the overlay plane embedded in the pixel
+        data, along with the pixel cells before and the pixel cells expected
+        after extraction.
+        """
+        plane = np.asarray(plane, dtype="u1")
+        if plane.ndim == 2:
+            plane = plane[np.newaxis, ...]
+        overlay_frames, overlay_rows, overlay_columns = plane.shape
+
+        ds = Dataset()
+        ds.file_meta = FileMetaDataset()
+        ds.file_meta.TransferSyntaxUID = tsyntax
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = "MONOCHROME2"
+        ds.PixelRepresentation = pixel_representation
+        ds.BitsAllocated = bits_allocated
+        ds.BitsStored = bits_stored
+        ds.HighBit = bits_stored - 1
+        ds.Rows = rows
+        ds.Columns = columns
+        if frames > 1:
+            ds.NumberOfFrames = str(frames)
+
+        # Deterministic pixel values within the stored bits
+        index = np.arange(frames * rows * columns)
+        arr = (index * 37 % 2**bits_stored).astype(f"uint{bits_allocated}")
+        arr = arr.reshape(frames, rows, columns)
+        # A pattern in bits used by other (non-extracted) overlays
+        for bit in other_bits:
+            arr |= ((index * 13 % 2) << bit).astype(arr.dtype).reshape(arr.shape)
+
+        # Embed the overlay plane, clipped to the image bounds
+        r0, c0 = origin[1] - 1, origin[0] - 1
+        rs, re = max(r0, 0), min(r0 + overlay_rows, rows)
+        cs, ce = max(c0, 0), min(c0 + overlay_columns, columns)
+        first = frame_origin - 1
+        if bit_position < bits_allocated:
+            for f in range(min(overlay_frames, frames - first)):
+                region = plane[f, rs - r0 : re - r0, cs - c0 : ce - c0]
+                arr[first + f, rs:re, cs:ce] |= region.astype(arr.dtype) << bit_position
+
+        byteorder = "<" if tsyntax.is_little_endian else ">"
+        ds.PixelData = arr.astype(f"{byteorder}u{bits_allocated // 8}").tobytes()
+
+        ds.add_new((group, 0x0010), "US", overlay_rows)
+        ds.add_new((group, 0x0011), "US", overlay_columns)
+        ds.add_new((group, 0x0050), "SS", list(origin))
+        ds.add_new((group, 0x0100), "US", bits_allocated)
+        ds.add_new((group, 0x0102), "US", bit_position)
+        if overlay_frames > 1:
+            ds.add_new((group, 0x0015), "IS", overlay_frames)
+        if frame_origin != 1:
+            ds.add_new((group, 0x0051), "US", frame_origin)
+
+        # The expected pixel cells after the overlay's bits are cleared
+        after = arr.copy()
+        if bit_position < bits_allocated:
+            mask = arr.dtype.type(1 << bit_position)
+            after[first : first + overlay_frames, rs:re, cs:ce] &= ~mask
+
+        return ds, arr, after, plane
+
+    def test_extract_basic(self):
+        """Test extracting an overlay embedded in the pixel data."""
+        plane = np.array(
+            [
+                [1, 0, 1, 0, 1],
+                [0, 1, 0, 1, 0],
+                [1, 1, 0, 0, 1],
+            ]
+        )
+        ds, before, after, plane = self.make_ds(plane, origin=(2, 3), other_bits=(14,))
+        original_pixel_data = ds.PixelData
+
+        out = extract_overlay(ds, 0x6000)
+        assert out is ds
+
+        # The standalone overlay elements have been added/updated
+        assert ds[0x6000, 0x0100].value == 1
+        assert ds[0x6000, 0x0102].value == 0
+        # 15 overlay bits, packed LSB-first into 2 bytes
+        assert ds[0x6000, 0x3000].value == b"\x55\x4d"
+        assert np.array_equal(get_overlay_array(ds, 0x6000), plane[0])
+
+        # Only the overlay's bits in its region have been cleared
+        assert ds.PixelData == after.astype("<u2").tobytes()
+        # The other overlay's bits are unchanged
+        assert np.array_equal(
+            np.frombuffer(ds.PixelData, dtype="<u2") & (1 << 14),
+            np.frombuffer(original_pixel_data, dtype="<u2") & (1 << 14),
+        )
+        # The stored pixel values are unchanged
+        assert np.array_equal(ds.pixel_array, (before & 0x0FFF).reshape(6, 6))
+
+    def test_odd_width_packing(self):
+        """Test packing when the overlay width is not a multiple of 8."""
+        plane = np.ones((2, 7), dtype="u1")
+        ds, _, _, _ = self.make_ds(plane, rows=2, columns=7)
+        extract_overlay(ds, 0x6000)
+        # 14 bits -> 2 bytes, already even so no padding byte
+        assert ds[0x6000, 0x3000].value == b"\xff\x3f"
+        assert np.array_equal(get_overlay_array(ds, 0x6000), plane)
+
+    def test_negative_origin(self):
+        """Test an overlay with a negative origin is clipped to the image."""
+        plane = np.array(
+            [
+                [1, 1, 1, 1],
+                [1, 0, 0, 1],
+                [1, 0, 1, 1],
+            ]
+        )
+        ds, before, after, plane = self.make_ds(
+            plane, rows=4, columns=4, origin=(-1, 0)
+        )
+        # Set the overlay bit outside the overlay's region
+        arr = np.frombuffer(ds.PixelData, dtype="<u2").reshape(4, 4).copy()
+        arr[3, 3] |= 1 << 15
+        ds.PixelData = arr.tobytes()
+
+        extract_overlay(ds, 0x6000)
+
+        # Overlay pixels outside the image are 0, the rest match the plane
+        expected_plane = np.zeros((3, 4), dtype="u1")
+        expected_plane[1:3, 2:4] = plane[0, 1:3, 2:4]
+        assert np.array_equal(get_overlay_array(ds, 0x6000), expected_plane)
+
+        out = np.frombuffer(ds.PixelData, dtype="<u2").reshape(4, 4)
+        # The overlay's bits are cleared only within its region
+        assert not (out[0:2, 0:2] & (1 << 15)).any()
+        # Bits outside the overlay's region are unchanged
+        assert out[3, 3] & (1 << 15)
+        assert np.array_equal(out & 0x0FFF, arr & 0x0FFF)
+
+    def test_multiframe(self):
+        """Test multi-frame overlays are packed continuously across frames."""
+        plane = np.array(
+            [
+                [[1, 0, 1], [0, 1, 0], [1, 1, 1], [0, 0, 1]],
+                [[0, 1, 1], [1, 0, 1], [0, 1, 0], [1, 1, 0]],
+            ]
+        )
+        ds, before, after, plane = self.make_ds(
+            plane, rows=4, columns=3, frames=3, frame_origin=2
+        )
+        # Set the overlay bit in an image frame the overlay doesn't apply to
+        arr = np.frombuffer(ds.PixelData, dtype="<u2").reshape(3, 4, 3).copy()
+        arr[0] |= 1 << 15
+        ds.PixelData = arr.tobytes()
+
+        extract_overlay(ds, 0x6000)
+
+        # 24 bits packed continuously across the frame boundary
+        assert ds[0x6000, 0x3000].value == pack_bits(plane.ravel())
+        assert np.array_equal(get_overlay_array(ds, 0x6000), plane)
+
+        out = np.frombuffer(ds.PixelData, dtype="<u2").reshape(3, 4, 3)
+        # The frame the overlay doesn't apply to is unchanged
+        assert np.array_equal(out[0], arr[0])
+        # The overlay's bits are cleared from the frames it applies to
+        assert not (out[1:] & (1 << 15)).any()
+        assert np.array_equal(out & 0x0FFF, arr & 0x0FFF)
+
+    def test_signed_pixels(self):
+        """Test extraction with signed pixel representation."""
+        plane = np.array([[1, 1, 0], [0, 1, 1]])
+        ds, before, after, _ = self.make_ds(
+            plane, rows=2, columns=3, pixel_representation=1
+        )
+        extract_overlay(ds, 0x6000)
+        assert np.array_equal(ds.pixel_array, after.reshape(2, 3))
+        assert np.array_equal(ds.pixel_array, (before & 0x0FFF).reshape(2, 3))
+
+    def test_big_endian(self):
+        """Test extraction with a big endian transfer syntax."""
+        plane = np.array([[1, 0, 1], [0, 1, 0]])
+        ds, before, after, _ = self.make_ds(
+            plane, rows=2, columns=3, tsyntax=ExplicitVRBigEndian
+        )
+        extract_overlay(ds, 0x6000)
+        assert ds.PixelData == after.astype(">u2").tobytes()
+        assert np.array_equal(get_overlay_array(ds, 0x6000), plane)
+
+    def test_raises_invalid_group(self):
+        """Test an invalid overlay group raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"))
+        msg = "The overlay group must be an even number"
+        with pytest.raises(ValueError, match=msg):
+            extract_overlay(ds, 0x6001)
+
+    def test_raises_missing_overlay_element(self):
+        """Test a missing overlay element raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"))
+        del ds[0x6000, 0x0010]
+        msg = "required elements are missing.*OverlayRows"
+        with pytest.raises(AttributeError, match=msg):
+            extract_overlay(ds, 0x6000)
+
+    def test_raises_missing_pixel_data(self):
+        """Test missing pixel data raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"))
+        del ds.PixelData
+        msg = "required elements are missing.*PixelData"
+        with pytest.raises(AttributeError, match=msg):
+            extract_overlay(ds, 0x6000)
+
+    def test_raises_already_standalone(self):
+        """Test an overlay not stored in the pixel data raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"))
+        ds[0x6000, 0x0100].value = 1
+        msg = "not stored in the pixel data"
+        with pytest.raises(ValueError, match=msg):
+            extract_overlay(ds, 0x6000)
+
+    def test_raises_overlay_data_present(self):
+        """Test existing overlay data raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"))
+        ds.add_new((0x6000, 0x3000), "OW", b"\x00\x00")
+        msg = "'Overlay Data' is already present"
+        with pytest.raises(ValueError, match=msg):
+            extract_overlay(ds, 0x6000)
+
+    def test_raises_compressed(self):
+        """Test a compressed transfer syntax raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"), tsyntax=JPEGBaseline8Bit)
+        msg = "compressed transfer syntax"
+        with pytest.raises(ValueError, match=msg):
+            extract_overlay(ds, 0x6000)
+
+    def test_raises_bit_in_stored_bits(self):
+        """Test an overlay bit within the stored bits raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"), bit_position=11)
+        msg = "falls within the stored pixel bits"
+        with pytest.raises(ValueError, match=msg):
+            extract_overlay(ds, 0x6000)
+
+    def test_raises_bit_outside_allocated(self):
+        """Test an overlay bit outside the allocated bits raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"), bit_position=16)
+        msg = "outside the allocated bits"
+        with pytest.raises(ValueError, match=msg):
+            extract_overlay(ds, 0x6000)
+
+    def test_raises_mismatched_bits_allocated(self):
+        """Test mismatched bits allocated raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"))
+        ds[0x6000, 0x0100].value = 8
+        msg = "doesn't match"
+        with pytest.raises(ValueError, match=msg):
+            extract_overlay(ds, 0x6000)
+
+    def test_raises_frames_out_of_range(self):
+        """Test overlay frames exceeding the image frames raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2, 2), dtype="u1"), frames=1)
+        msg = "exceed the number of image frames"
+        with pytest.raises(ValueError, match=msg):
+            extract_overlay(ds, 0x6000)
+
+    def test_raises_overlay_outside_image(self):
+        """Test an overlay region outside the image raises an exception."""
+        ds, *_ = self.make_ds(np.ones((2, 2), dtype="u1"), origin=(10, 10))
+        msg = "lies outside the 6 x 6 pixel data"
+        with pytest.raises(ValueError, match=msg):
+            extract_overlay(ds, 0x6000)

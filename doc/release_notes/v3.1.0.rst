@@ -14,6 +14,9 @@ Changes
   per-frame metadata to help account for inter-frame variations in frame properties
   when decoding.
 * Apply PEP 735 to build environment. It modifies how build dependencies are installed.
+* Added :func:`~pydicom.overlays.extract_overlay` to extract an overlay plane
+  stored in the unused bits of the *Pixel Data* into a standalone *Overlay
+  Data* element, clearing only the extracted overlay's bits.
 
 Fixes
 -----

@@ -1,1 +1,1 @@
-from pydicom.overlays.numpy_handler import get_overlay_array
+from pydicom.overlays.numpy_handler import extract_overlay, get_overlay_array
