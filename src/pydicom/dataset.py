@@ -3073,6 +3073,23 @@ class Dataset:  # noqa: PLW1641
                 for ds in elem.value:
                     yield from ds.iterall()
 
+    def plan_signature_edits(self) -> "pydicom.digisig.SignatureEditPlan":
+        """Return a signature-aware edit plan for this :class:`Dataset`.
+
+        The plan collects pending element changes, reports which digital
+        signatures in the *Digital Signatures Sequence* (at any nesting
+        level) would be invalidated by them, and then either rejects the
+        changes or removes the affected signatures when committing.
+
+        Returns
+        -------
+        pydicom.digisig.SignatureEditPlan
+            A new edit plan bound to this dataset.
+        """
+        from pydicom.digisig import SignatureEditPlan
+
+        return SignatureEditPlan(self)
+
     def walk(
         self, callback: Callable[["Dataset", DataElement], None], recursive: bool = True
     ) -> None:

@@ -20,6 +20,7 @@ This API reference guide details the functions, modules and objects included in
    data
    datadict
    dataset
+   digisig
    elem
    examples
    encaps
