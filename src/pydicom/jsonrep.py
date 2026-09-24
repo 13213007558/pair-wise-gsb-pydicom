@@ -75,6 +75,109 @@ BulkDataType = None | str | int | float | bytes
 BulkDataHandlerType = Callable[[str, str, str], BulkDataType] | None
 
 
+#: The path to a nested element as a tuple of (tag, item index) pairs, one
+#: per ancestor **SQ** element, e.g. `(("00081115", 0), ("52009229", 2))`
+BulkDataPathType: TypeAlias = tuple[tuple[str, int], ...]
+
+
+class BulkDataValue:
+    """A lazily-resolved bulk data value referenced by a "BulkDataURI".
+
+    Parsing a DICOM JSON Model dataset does not retrieve the bulk data -
+    instead the application-provided `loader` is called the first time the
+    value is actually needed, such as when accessing
+    :attr:`~pydicom.dataelem.DataElement.value`, decoding pixel data or
+    writing the dataset to a DICOM file. The class itself performs no I/O;
+    retrieval is entirely delegated to `loader`.
+
+    A successfully loaded value is cached, so the loader is called at most
+    once per :class:`BulkDataValue`. If the loader raises an exception the
+    value stays unresolved and the load may be retried explicitly using
+    :meth:`retry` (or simply by accessing the value again).
+
+    .. versionadded:: 3.1
+    """
+
+    def __init__(
+        self,
+        tag: str,
+        vr: str,
+        uri: str,
+        loader: Callable[[str, str, str], BulkDataType],
+        path: BulkDataPathType = (),
+    ) -> None:
+        """Create a new lazy bulk data value.
+
+        Parameters
+        ----------
+        tag : str
+            The data element's tag in uppercase hex format like
+            '7FE00010'.
+        vr : str
+            The data element's value representation.
+        uri : str
+            The "BulkDataURI" of the value, as given in the JSON
+            representation.
+        loader : callable
+            A callable accepting `(tag, vr, uri)` and returning the actual
+            value of the data element (e.g. retrieved via DICOMweb WADO-RS).
+        path : tuple[tuple[str, int], ...], optional
+            The path of the element's dataset within nested sequences as
+            '((tag, item index), ...)' pairs, empty for a top-level
+            element.
+        """
+        self.tag = tag
+        self.vr = vr
+        self.uri = uri
+        self.path = tuple(path)
+        self._loader = loader
+        self._loaded = False
+        self._value: BulkDataType = None
+
+    @property
+    def is_loaded(self) -> bool:
+        """Return True if the value has been successfully retrieved."""
+        return self._loaded
+
+    def load(self) -> BulkDataType:
+        """Return the bulk data value, retrieving it if necessary.
+
+        The result of the first successful retrieval is cached and returned
+        on subsequent calls without calling the loader again. If the loader
+        raises an exception the value remains unresolved and the exception
+        is propagated to the caller.
+        """
+        if not self._loaded:
+            value = self._loader(self.tag, self.vr, self.uri)
+            self._value = value
+            self._loaded = True
+
+        return self._value
+
+    def retry(self) -> BulkDataType:
+        """Explicitly retry retrieving the value after a failed load.
+
+        Discards any cached state and calls the loader again.
+        """
+        self._loaded = False
+        self._value = None
+        return self.load()
+
+    def __copy__(self) -> "BulkDataValue":
+        # Share the instance (and its cache) with copies of the element
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "BulkDataValue":
+        return self
+
+    def __repr__(self) -> str:
+        state = "loaded" if self._loaded else "pending"
+        return (
+            f"<BulkDataValue tag={self.tag} vr={self.vr} uri={self.uri!r} "
+            f"path={self.path!r} ({state})>"
+        )
+
+
 class JsonDataElementConverter:
     """Convert from a JSON struct to a :class:`DataElement`.
 
@@ -96,6 +199,7 @@ class JsonDataElementConverter:
         bulk_data_uri_handler: (
             BulkDataHandlerType | Callable[[str], BulkDataType] | None
         ) = None,
+        path: BulkDataPathType = (),
     ) -> None:
         """Create a new converter instance.
 
@@ -124,12 +228,17 @@ class JsonDataElementConverter:
             corresponding element will have an "empty" value such as
             ``""``, ``b""`` or ``None`` depending on the
             `vr` (i.e. the Value Multiplicity will be 0).
+        path : tuple[tuple[str, int], ...], optional
+            The path of the element's dataset within nested sequences as
+            `((tag, item index), ...)` pairs, empty for a top-level
+            element. Only used for lazy bulk data values.
         """
         self.dataset_class = dataset_class
         self.tag = tag
         self.vr = vr
         self.value = value
         self.value_key = value_key
+        self.path = tuple(path)
         self.bulk_data_element_handler: BulkDataHandlerType
 
         handler = bulk_data_uri_handler
@@ -168,7 +277,10 @@ class JsonDataElementConverter:
                 return empty_value_for_VR(self.vr)
 
             val = cast(list[ValueType], self.value)
-            element_value = [self.get_regular_element_value(v) for v in val]
+            element_value = [
+                self.get_regular_element_value(v, self.path + ((self.tag, i),))
+                for i, v in enumerate(val)
+            ]
             if len(element_value) == 1 and self.vr != VR.SQ:
                 element_value = element_value[0]
 
@@ -210,19 +322,38 @@ class JsonDataElementConverter:
                 )
                 return empty_value_for_VR(self.vr)
 
-            return self.bulk_data_element_handler(self.tag, self.vr, value)
+            if not value:
+                # An empty URI references no bulk data - treat the element
+                # as empty without calling the handler
+                return empty_value_for_VR(self.vr)
+
+            # Defer retrieval of the bulk data until the value is actually
+            # needed (e.g. accessing the element's value, decoding pixel
+            # data or writing the dataset to a file)
+            return BulkDataValue(
+                tag=self.tag,
+                vr=self.vr,
+                uri=value,
+                loader=self.bulk_data_element_handler,
+                path=self.path,
+            )
 
         raise ValueError(
             f"Unknown attribute name '{self.value_key}' for tag {self.tag}"
         )
 
-    def get_regular_element_value(self, value: ValueType) -> Any:
+    def get_regular_element_value(
+        self, value: ValueType, path: BulkDataPathType = ()
+    ) -> Any:
         """Return a the data element value created from a json "Value" entry.
 
         Parameters
         ----------
         value : None, str, int, float or dict
             The data element's value from the json entry.
+        path : tuple[tuple[str, int], ...], optional
+            The path of the value's dataset within nested sequences, only
+            used for **SQ** elements.
 
         Returns
         -------
@@ -235,7 +366,7 @@ class JsonDataElementConverter:
         if self.vr == VR.SQ:  # Dataset
             # May be an empty dict
             value = cast(dict[str, Any], value)
-            return self.get_sequence_item(value)
+            return self.get_sequence_item(value, path)
 
         if value is None:
             return empty_value_for_VR(self.vr)
@@ -256,13 +387,18 @@ class JsonDataElementConverter:
 
         return value
 
-    def get_sequence_item(self, value: SQValueType) -> "Dataset":
+    def get_sequence_item(
+        self, value: SQValueType, path: BulkDataPathType = ()
+    ) -> "Dataset":
         """Return a sequence item for the JSON dict `value`.
 
         Parameters
         ----------
         value : dict or None
             The sequence item from the JSON entry.
+        path : tuple[tuple[str, int], ...], optional
+            The path of the sequence item's dataset within nested sequences
+            as `((tag, item index), ...)` pairs.
 
         Returns
         -------
@@ -301,6 +437,7 @@ class JsonDataElementConverter:
                     val[value_key],
                     value_key,
                     self.bulk_data_element_handler,
+                    path=path,
                 )
             ds.add(elem)
 

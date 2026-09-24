@@ -27,7 +27,12 @@ from pydicom.datadict import (
     repeater_has_tag,
 )
 from pydicom.hooks import hooks
-from pydicom.jsonrep import JsonDataElementConverter, BulkDataType
+from pydicom.jsonrep import (
+    JsonDataElementConverter,
+    BulkDataType,
+    BulkDataValue,
+    BulkDataPathType,
+)
 from pydicom.misc import warn_and_log
 from pydicom.multival import MultiValue
 from pydicom.tag import Tag, BaseTag, _LUT_DESCRIPTOR_TAGS
@@ -228,6 +233,7 @@ class DataElement:  # noqa: PLW1641
             VR == VR_.UN
             and not tag.is_private
             and config.replace_un_with_known_vr
+            and not isinstance(value, BulkDataValue)
             and (is_undefined_length or value is None or len(value) < 0xFFFF)
         ):
             try:
@@ -266,6 +272,7 @@ class DataElement:  # noqa: PLW1641
             | Callable[[str], BulkDataType]
             | None
         ) = None,
+        path: BulkDataPathType = (),
     ) -> "DataElement":
         """Return a :class:`DataElement` from a DICOM JSON Model attribute
         object.
@@ -293,6 +300,10 @@ class DataElement:  # noqa: PLW1641
             corresponding element will have an "empty" value such as
             ``""``, ``b""`` or ``None`` depending on the `vr` (i.e. the
             Value Multiplicity will be 0).
+        path : tuple[tuple[str, int], ...], optional
+            The path of the element's dataset within nested sequences as
+            ((tag, item index), ...) pairs, empty for a top-level element.
+            Only used for lazy bulk data values.
 
         Returns
         -------
@@ -300,7 +311,13 @@ class DataElement:  # noqa: PLW1641
         """
         # TODO: test wado-rs retrieve wrapper
         converter = JsonDataElementConverter(
-            dataset_class, tag, vr, value, value_key, bulk_data_uri_handler
+            dataset_class,
+            tag,
+            vr,
+            value,
+            value_key,
+            bulk_data_uri_handler,
+            path=path,
         )
         elem_value = converter.get_element_values()
 
@@ -348,7 +365,18 @@ class DataElement:  # noqa: PLW1641
             Mapping representing a JSON encoded data element as ``{str: Any}``.
         """
         json_element: dict[str, Any] = {"vr": self.VR}
-        if self.VR in (BYTES_VR | AMBIGUOUS_VR) - {VR_.US_SS}:
+        if isinstance(self._value, BulkDataValue):
+            # An unresolved bulk data value is exported with its original
+            # "BulkDataURI" - the data is not retrieved for JSON export
+            json_element["BulkDataURI"] = self._value.uri
+            return json_element
+
+        # An unknown VR with a bytes value (such as a resolved bulk data
+        # value) is encoded as binary data
+        is_binary = self.VR in (BYTES_VR | AMBIGUOUS_VR) - {VR_.US_SS} or (
+            self.VR not in VR_.__members__ and isinstance(self._value, bytes)
+        )
+        if is_binary:
             if not self.is_empty:
                 binary_value = self.value
                 # Base64 makes the encoded value 1/3 longer.
@@ -465,7 +493,15 @@ class DataElement:  # noqa: PLW1641
         Any
             The element's value.
         """
-        return self._value
+        value = self._value
+        if isinstance(value, BulkDataValue):
+            # Resolve the lazy bulk data value - a successful load is
+            # cached by replacing the stored value, a failed load leaves
+            # the BulkDataValue in place so it can be retried
+            value = value.load()
+            self._value = value
+
+        return value
 
     @value.setter
     def value(self, val: Any) -> None:
@@ -513,24 +549,29 @@ class DataElement:  # noqa: PLW1641
         if self.VR == VR_.SQ:
             return 1
 
-        if self.value is None:
+        value = self._value
+        if isinstance(value, BulkDataValue):
+            # An unresolved bulk data reference counts as a single value
+            return 1
+
+        if value is None:
             return 0
 
-        if isinstance(self.value, str | bytes | PersonName):
-            return 1 if self.value else 0
+        if isinstance(value, str | bytes | PersonName):
+            return 1 if value else 0
 
-        if isinstance(self.value, BufferedIOBase):
+        if isinstance(value, BufferedIOBase):
             try:
-                return 1 if buffer_length(self.value) else 0
+                return 1 if buffer_length(value) else 0
             except Exception as exc:
                 raise type(exc)(f"Invalid buffer for {self.tag} '{self.name}': {exc}")
 
         try:
-            iter(self.value)
+            iter(value)
         except TypeError:
             return 1
 
-        return len(self.value)
+        return len(value)
 
     @property
     def is_buffered(self) -> bool:
@@ -573,6 +614,10 @@ class DataElement:  # noqa: PLW1641
         Uses the element's VR in order to determine the conversion method and
         resulting type.
         """
+        if isinstance(val, BulkDataValue):
+            # A lazy bulk data value is stored as-is and resolved on access
+            return val
+
         if (
             self.tag == 0x7FE00010
             and config.have_numpy
@@ -725,6 +770,10 @@ class DataElement:  # noqa: PLW1641
     @property
     def repval(self) -> str:
         """Return a :class:`str` representation of the element's value."""
+        if isinstance(self._value, BulkDataValue):
+            # Don't retrieve the bulk data just to display the element
+            return repr(self._value)
+
         if self.is_buffered:
             # in case the buffer is a stream and non-seekable we don't want
             # to consume any bytes

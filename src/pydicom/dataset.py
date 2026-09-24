@@ -3149,6 +3149,12 @@ class Dataset:  # noqa: PLW1641
             "BulkDataURI" value or just the "BulkDataURI" value of the JSON
             representation of a data element and returns the actual value of
             that data element (retrieved via DICOMweb WADO-RS). If no
+            `bulk_data_uri_handler` is specified then the corresponding
+            element's value is a lazy
+            :class:`~pydicom.jsonrep.BulkDataValue` - the handler is not
+            called until the value is actually needed, such as when
+            accessing the element's value, decoding pixel data or writing
+            the dataset to a DICOM file. If no
             `bulk_data_uri_handler` is specified (default) then the
             corresponding element will have an "empty" value such as
             ``""``, ``b""`` or ``None`` depending on the `vr` (i.e. the

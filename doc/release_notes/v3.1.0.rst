@@ -87,3 +87,9 @@ Enhancements
   :func:`~pydicom.pixels.convert_color_space` where applicable (:issue:`2228`)
 * Take the color space information from an Adobe APP14 marker into account when decoding
   pixel data for JPEG transfer syntaxes.
+* The "BulkDataURI" values of a DICOM JSON Model dataset are now resolved lazily -
+  parsing with a `bulk_data_uri_handler` stores a
+  :class:`~pydicom.jsonrep.BulkDataValue` that only calls the handler when the
+  element's value is actually needed, such as on value access, pixel data decoding
+  or writing the dataset to a DICOM file. Exporting back to JSON keeps the original
+  URI without retrieving the bulk data.
