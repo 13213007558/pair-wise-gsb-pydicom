@@ -9,6 +9,12 @@ Changes
 * Prefer using Pillow when decoding *JPEG Baseline 8-bit* and *JPEG Extended 12-bit*
 * Improvements made to communications with the plugins when decoding and encoding pixel
   data and correcting for inter-frame decoding variations in multi-frame datasets (:pr:`2262`).
+* Added the `defer_bulk_data` parameter to :meth:`Dataset.from_json()
+  <pydicom.dataset.Dataset.from_json>` to allow deferred retrieval of bulk data
+  referenced by a "BulkDataURI". The value is kept as a
+  :class:`~pydicom.jsonrep.LazyBulkData` instance that preserves the URI, VR and
+  sequence item path, and is only resolved when the element's value is accessed or
+  the dataset is written to a DICOM file.
 * The metadata returned by :meth:`Decoder.as_buffer
   <pydicom.pixels.decoders.base.Decoder.as_buffer>` is now a ``dict`` containing the
   per-frame metadata to help account for inter-frame variations in frame properties

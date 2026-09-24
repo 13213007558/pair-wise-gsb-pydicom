@@ -27,7 +27,7 @@ from pydicom.datadict import (
     repeater_has_tag,
 )
 from pydicom.hooks import hooks
-from pydicom.jsonrep import JsonDataElementConverter, BulkDataType
+from pydicom.jsonrep import JsonDataElementConverter, BulkDataType, LazyBulkData
 from pydicom.misc import warn_and_log
 from pydicom.multival import MultiValue
 from pydicom.tag import Tag, BaseTag, _LUT_DESCRIPTOR_TAGS
@@ -228,6 +228,7 @@ class DataElement:  # noqa: PLW1641
             VR == VR_.UN
             and not tag.is_private
             and config.replace_un_with_known_vr
+            and not isinstance(value, LazyBulkData)
             and (is_undefined_length or value is None or len(value) < 0xFFFF)
         ):
             try:
@@ -266,6 +267,8 @@ class DataElement:  # noqa: PLW1641
             | Callable[[str], BulkDataType]
             | None
         ) = None,
+        defer_bulk_data: bool = False,
+        path: tuple[tuple[str, int], ...] = (),
     ) -> "DataElement":
         """Return a :class:`DataElement` from a DICOM JSON Model attribute
         object.
@@ -293,6 +296,15 @@ class DataElement:  # noqa: PLW1641
             corresponding element will have an "empty" value such as
             ``""``, ``b""`` or ``None`` depending on the `vr` (i.e. the
             Value Multiplicity will be 0).
+        defer_bulk_data : bool, optional
+            If ``True``, don't retrieve the value of elements with a
+            "BulkDataURI" value key, but set the element's value to a
+            :class:`~pydicom.jsonrep.LazyBulkData` instance that retrieves
+            the value only when it's accessed (default ``False``).
+        path : tuple[tuple[str, int], ...], optional
+            The path of ``(tag, item index)`` pairs of the ancestor **SQ**
+            elements containing the element, ordered from the outermost
+            sequence inwards. Used internally for deferred bulk data.
 
         Returns
         -------
@@ -300,7 +312,14 @@ class DataElement:  # noqa: PLW1641
         """
         # TODO: test wado-rs retrieve wrapper
         converter = JsonDataElementConverter(
-            dataset_class, tag, vr, value, value_key, bulk_data_uri_handler
+            dataset_class,
+            tag,
+            vr,
+            value,
+            value_key,
+            bulk_data_uri_handler,
+            defer_bulk_data=defer_bulk_data,
+            path=path,
         )
         elem_value = converter.get_element_values()
 
@@ -348,6 +367,12 @@ class DataElement:  # noqa: PLW1641
             Mapping representing a JSON encoded data element as ``{str: Any}``.
         """
         json_element: dict[str, Any] = {"vr": self.VR}
+        if isinstance(self._value, LazyBulkData):
+            # Keep the reference to the bulk data rather than retrieving
+            #   and inlining the value
+            json_element["BulkDataURI"] = self._value.uri
+            return json_element
+
         if self.VR in (BYTES_VR | AMBIGUOUS_VR) - {VR_.US_SS}:
             if not self.is_empty:
                 binary_value = self.value
@@ -465,10 +490,19 @@ class DataElement:  # noqa: PLW1641
         Any
             The element's value.
         """
+        if isinstance(self._value, LazyBulkData):
+            # Deferred bulk data - retrieve the actual value on access
+            return self._convert_value(self._value.resolve())
+
         return self._value
 
     @value.setter
     def value(self, val: Any) -> None:
+        if isinstance(val, LazyBulkData):
+            # Deferred bulk data - store as-is without conversion
+            self._value = val
+            return
+
         # O* elements set using a buffer object
         if isinstance(val, BufferedIOBase):
             if self.VR not in BUFFERABLE_VRS:
@@ -513,6 +547,11 @@ class DataElement:  # noqa: PLW1641
         if self.VR == VR_.SQ:
             return 1
 
+        if isinstance(self._value, LazyBulkData) and not self._value.is_resolved:
+            # Deferred bulk data that hasn't been retrieved yet represents a
+            #   single (bulk) value
+            return 1
+
         if self.value is None:
             return 0
 
@@ -542,6 +581,14 @@ class DataElement:  # noqa: PLW1641
     @property
     def is_empty(self) -> bool:
         """Return ``True`` if the element has no value."""
+        if isinstance(self._value, LazyBulkData):
+            if not self._value.is_resolved:
+                # The value hasn't been retrieved yet, but a "BulkDataURI"
+                #   is present, so the element is not considered empty
+                return False
+
+            return self._value.value in (None, "", b"")
+
         if self.VR == VR_.SQ:
             return not bool(self.value)
 
@@ -725,6 +772,9 @@ class DataElement:  # noqa: PLW1641
     @property
     def repval(self) -> str:
         """Return a :class:`str` representation of the element's value."""
+        if isinstance(self._value, LazyBulkData) and not self._value.is_resolved:
+            return f"<deferred bulk data from '{self._value.uri}'>"
+
         if self.is_buffered:
             # in case the buffer is a stream and non-seekable we don't want
             # to consume any bytes
