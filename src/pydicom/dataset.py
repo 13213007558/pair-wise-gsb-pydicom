@@ -218,6 +218,184 @@ class PrivateBlock:
         self.dataset[tag].private_creator = self.private_creator
 
 
+# Path to an element within (possibly nested) datasets: a tuple of tags
+# where every sequence tag is followed by the corresponding item index.
+MergePathType: TypeAlias = "tuple[BaseTag | int, ...]"
+
+
+def _record_private_paths(
+    ds: "Dataset", path: MergePathType, mapping: dict[MergePathType, BaseTag]
+) -> None:
+    """Add identity mappings for all private elements in `ds` to `mapping`.
+
+    Used for parts of the source dataset that are copied without remapping
+    (e.g. the items of a copied private sequence), so that the returned
+    mapping covers every private element of the merged dataset.
+    """
+    for elem in ds:
+        if elem.tag.is_private:
+            mapping[path + (elem.tag,)] = elem.tag
+        if elem.VR == "SQ":
+            for index, item in enumerate(elem.value):
+                _record_private_paths(item, path + (elem.tag, index), mapping)
+
+
+def _plan_private_merge(
+    target: "Dataset",
+    source: "Dataset",
+    path: MergePathType,
+    on_conflict: str,
+    ops: list[tuple],
+    mapping: dict[MergePathType, BaseTag],
+) -> None:
+    """Plan the merge of the private elements from `source` into `target`.
+
+    Validates the private elements of `source` and computes the private
+    creator slot allocation and the needed copy operations without modifying
+    `target`.
+
+    Raises
+    ------
+    ValueError
+        If `source` contains an illegal private tag, a private element
+        without a corresponding private creator, an empty private creator,
+        if no free private creator slot is available in `target`, or if
+        `on_conflict` is ``"error"`` and a merged element already exists
+        in `target`.
+    """
+    creators: dict[tuple[int, int], DataElement] = {}
+    blocks: dict[tuple[int, int], list[DataElement]] = {}
+    sequences: list[DataElement] = []
+
+    for elem in source:
+        group, element = elem.tag.group, elem.tag.element
+        if group % 2 == 0:
+            if elem.VR == "SQ":
+                sequences.append(elem)
+            continue
+        if element == 0x0000:
+            # private group length element, not merged
+            continue
+        if element < 0x1000:
+            if not 0x0010 <= element <= 0x00FF:
+                raise ValueError(
+                    f"Illegal private tag {elem.tag} in the source dataset: "
+                    "elements below (gggg,1000) in a private group must be "
+                    "private creator elements in the range (gggg,0010-00FF)"
+                )
+            creators[(group, element)] = elem
+            continue
+        creator_element = element >> 8
+        if Tag(group, creator_element) not in source:
+            raise ValueError(
+                f"Private element {elem.tag} in the source dataset has no "
+                f"corresponding private creator element "
+                f"({group:04X},{creator_element:04X})"
+            )
+        blocks.setdefault((group, creator_element), []).append(elem)
+
+    claimed: set[tuple[int, int]] = set()
+    for group, creator_element in sorted(blocks):
+        creator_elem = creators[(group, creator_element)]
+        creator = str(creator_elem.value)
+        if not creator.strip():
+            raise ValueError(
+                f"Private creator element {creator_elem.tag} in the source "
+                "dataset has no value"
+            )
+        # find an unclaimed target block reserved by the same private creator
+        target_slot = next(
+            (
+                el
+                for el in range(0x10, 0x100)
+                if (group, el) not in claimed
+                and Tag(group, el) in target
+                and str(target[Tag(group, el)].value) == creator
+            ),
+            None,
+        )
+        if target_slot is None:
+            # allocate the first completely unused block in the target group
+            target_slot = next(
+                (
+                    el
+                    for el in range(0x10, 0x100)
+                    if (group, el) not in claimed
+                    and Tag(group, el) not in target
+                    and not any(
+                        Tag(group, (el << 8) | offset) in target
+                        for offset in range(1, 0x100)
+                    )
+                ),
+                None,
+            )
+        if target_slot is None:
+            raise ValueError(
+                f"No free private creator slot available in group "
+                f"0x{group:04X} of the target dataset for private creator "
+                f"'{creator}'"
+            )
+        claimed.add((group, target_slot))
+
+        new_creator_tag = Tag(group, target_slot)
+        mapping[path + (creator_elem.tag,)] = new_creator_tag
+        if new_creator_tag not in target:
+            ops.append(("set", target, new_creator_tag, creator_elem))
+
+        for elem in blocks[(group, creator_element)]:
+            offset = elem.tag.element & 0xFF
+            new_tag = Tag(group, (target_slot << 8) | offset)
+            mapping[path + (elem.tag,)] = new_tag
+            if new_tag in target:
+                if on_conflict == "error":
+                    raise ValueError(
+                        f"Merge conflict at {new_tag}: the target dataset "
+                        f"already contains an element at offset 0x{offset:02X} "
+                        f"of the block for private creator '{creator}'; use "
+                        "on_conflict='skip' or on_conflict='overwrite'"
+                    )
+                if on_conflict == "skip":
+                    continue
+            ops.append(("set", target, new_tag, elem))
+            if elem.VR == "SQ":
+                for index, item in enumerate(elem.value):
+                    _record_private_paths(item, path + (elem.tag, index), mapping)
+
+    # recurse into sequences present in both datasets; every item provides
+    # its own private creator slot allocation space
+    for elem in sequences:
+        if elem.tag not in target or target[elem.tag].VR != "SQ":
+            continue
+        target_items = target[elem.tag].value
+        for index, source_item in enumerate(elem.value):
+            item_path = path + (elem.tag, index)
+            if index < len(target_items):
+                _plan_private_merge(
+                    target_items[index],
+                    source_item,
+                    item_path,
+                    on_conflict,
+                    ops,
+                    mapping,
+                )
+            else:
+                ops.append(("append_item", target, elem.tag, source_item))
+                _record_private_paths(source_item, item_path, mapping)
+
+
+def _apply_private_merge(ops: list[tuple]) -> None:
+    """Apply the operations computed by :func:`_plan_private_merge`."""
+    for op in ops:
+        if op[0] == "set":
+            _, target, new_tag, source_elem = op
+            new_elem = copy.deepcopy(source_elem)
+            new_elem.tag = new_tag
+            target.add(new_elem)
+        else:  # "append_item"
+            _, target, seq_tag, source_item = op
+            target[seq_tag].value.append(copy.deepcopy(source_item))
+
+
 def _dict_equal(a: "Dataset", b: Any, exclude: list[str] | None = None) -> bool:
     """Common method for Dataset.__eq__ and FileDataset.__eq__
 
@@ -1249,6 +1427,94 @@ class Dataset:  # noqa: PLW1641
         """
         block = self.private_block(group, private_creator)
         return self.__getitem__(block.get_tag(element_offset))
+
+    def merge_private_tags(
+        self, source: "Dataset", on_conflict: str = "error"
+    ) -> dict[MergePathType, BaseTag]:
+        """Merge the private elements from `source` into this dataset.
+
+        Private elements are matched by private creator identity rather than
+        by numeric tag: for every private block in `source`, the block
+        reserved by the same private creator in this dataset is used if it
+        exists, otherwise a new private creator slot is allocated. This
+        means that identical numeric tags in both datasets (e.g.
+        ``(0009,0010)`` reserved by different private creators) never
+        overwrite each other.
+
+        If a private creator occupies several blocks in `source`, every
+        block is matched or allocated individually and the element offsets
+        within each block are preserved, so the relation between the
+        elements of the creator is kept.
+
+        Sequences present in both datasets are recursed into item by item;
+        every item provides its own private creator slot allocation space.
+        Items of a source sequence that have no counterpart in this dataset
+        are appended to it. Private sequences (and other private elements)
+        that don't exist in this dataset are copied as a whole, preserving
+        unknown VRs and raw values. Non-private elements other than
+        recursed sequences are not merged.
+
+        The merge is validated before anything is modified: if any error
+        occurs (see below), this dataset is left unchanged.
+
+        .. versionadded:: 3.1
+
+        Parameters
+        ----------
+        source : Dataset
+            The dataset to merge the private elements from.
+        on_conflict : str, optional
+            The policy used if this dataset already contains an element at
+            the target location of a merged element (i.e. the same private
+            creator already exists and the element offset is occupied):
+
+            * ``"error"`` (default): raise a :class:`ValueError`
+            * ``"skip"``: keep the existing element of this dataset
+            * ``"overwrite"``: replace the existing element with the
+              one from `source`
+
+        Returns
+        -------
+        dict[tuple[BaseTag | int, ...], BaseTag]
+            A mapping from the location of every merged private element in
+            `source` to its new tag in this dataset. The keys are element
+            paths: a tuple of the element tag for top-level elements, where
+            elements within sequence items are represented by the sequence
+            tag followed by the item index, e.g.
+            ``(0x0040A730, 0, 0x00091001)``. This allows fixing up
+            external references to merged private elements.
+
+        Raises
+        ------
+        ValueError
+            If `on_conflict` is invalid, if `source` contains an illegal
+            private tag, a private element without a corresponding private
+            creator, or an empty private creator, if no free private creator
+            slot is available in this dataset, or if `on_conflict` is
+            ``"error"`` and a merge conflict occurs.
+
+        Examples
+        --------
+        >>> ds = Dataset()
+        >>> ds.add_new((0x0009, 0x0010), "LO", "Creator A")
+        >>> ds.add_new((0x0009, 0x1001), "LO", "A")
+        >>> other = Dataset()
+        >>> other.add_new((0x0009, 0x0010), "LO", "Creator B")
+        >>> other.add_new((0x0009, 0x1001), "LO", "B")
+        >>> mapping = ds.merge_private_tags(other)
+        >>> ds.private_block(0x0009, "Creator B")[0x01].value
+        'B'
+        """
+        if on_conflict not in ("error", "skip", "overwrite"):
+            raise ValueError(
+                f"Invalid on_conflict value '{on_conflict}': must be one of "
+                "'error', 'skip', 'overwrite'"
+            )
+        ops: list[tuple] = []
+        mapping: dict[MergePathType, BaseTag] = {}
+        _plan_private_merge(self, source, (), on_conflict, ops, mapping)
+        _apply_private_merge(ops)
+        return mapping
 
     @overload
     def get_item(self, key: slice, *, keep_deferred: bool = ...) -> "Dataset":
