@@ -2,6 +2,7 @@
 
 from pydicom.pixels.decoders.base import get_decoder
 from pydicom.pixels.encoders.base import get_encoder
+from pydicom.pixels.crop import crop_pixels
 from pydicom.pixels.processing import (
     apply_color_lut,
     apply_icc_profile,

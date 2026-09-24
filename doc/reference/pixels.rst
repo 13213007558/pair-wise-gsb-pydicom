@@ -22,6 +22,7 @@ Image processing functions
    apply_windowing
    convert_color_space
    create_icc_transform
+   crop_pixels
 
 
 Utility functions
@@ -52,5 +53,6 @@ Sub-modules
 
    pixels.decoders
    pixels.encoders
+   pixels.crop
    pixels.processing
    pixels.utils
