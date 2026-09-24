@@ -25,6 +25,7 @@ import re
 from bisect import bisect_left
 from collections.abc import (
     ValuesView,
+    Iterable,
     Iterator,
     Callable,
     MutableSequence,
@@ -2149,6 +2150,57 @@ class Dataset:  # noqa: PLW1641
             generate_instance_uid=generate_instance_uid,
             **opts,
         )
+
+    def select_frames(
+        self,
+        indices: "Iterable[int]",
+        *,
+        sop_instance_uid: "str | UID | Callable[[Dataset], str | UID] | None" = None,
+    ) -> "Dataset":
+        """Return a new dataset containing only the frames given by `indices`.
+
+        .. versionadded:: 3.1
+
+        The order and any duplicates in `indices` are preserved, so
+        ``ds.select_frames([4, 1, 4])`` returns a dataset whose first and
+        third frames are both the frame at index ``4`` of the original
+        dataset. The *Pixel Data*, *Number of Frames*, *Per-frame Functional
+        Groups Sequence* and any *Referenced Frame Number* values in the
+        returned dataset are updated to correspond item-by-item with the
+        selected frames, while the *Shared Functional Groups Sequence* is
+        kept unchanged. The input dataset is left unchanged.
+
+        For encapsulated (compressed) pixel data the compressed frames are
+        copied without decoding and the Basic or Extended Offset Table is
+        rebuilt; if the frame boundaries cannot be determined reliably a
+        :class:`ValueError` is raised.
+
+        Parameters
+        ----------
+        indices : Iterable[int]
+            The zero-based indices of the frames to select, in the desired
+            order. Indices may be repeated and negative indices count back
+            from the last frame in the usual Python manner.
+        sop_instance_uid : str, UID, callable or None, optional
+            The policy used to produce the *SOP Instance UID* of the
+            returned dataset. If a :class:`str` or
+            :class:`~pydicom.uid.UID` then it is used directly. If
+            callable then it will be called with the new dataset and must
+            return the UID to use. If ``None`` (default) then a new UID
+            is generated using :func:`~pydicom.uid.generate_uid`.
+
+        Returns
+        -------
+        Dataset
+            A new dataset containing only the selected frames.
+
+        See Also
+        --------
+        pydicom.multiframe.select_frames
+        """
+        from pydicom.multiframe import select_frames
+
+        return select_frames(self, indices, sop_instance_uid=sop_instance_uid)
 
     def overlay_array(self, group: int) -> "numpy.ndarray":
         """Return the *Overlay Data* in `group` as a :class:`numpy.ndarray`.

@@ -29,6 +29,7 @@ This API reference guide details the functions, modules and objects included in
    handlers
    hooks
    misc
+   multiframe
    overlays
    pixels
    sr
