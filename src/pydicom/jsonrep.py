@@ -7,6 +7,7 @@ from typing import TypeAlias, Any, cast, TYPE_CHECKING
 from collections.abc import Callable
 
 from pydicom.misc import warn_and_log
+from pydicom.tag import Tag
 from pydicom.valuerep import FLOAT_VR, INT_VR, VR
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -75,6 +76,127 @@ BulkDataType = None | str | int | float | bytes
 BulkDataHandlerType = Callable[[str, str, str], BulkDataType] | None
 
 
+class BulkDataValue:
+    """A lazily-resolved bulk data value referenced by a "BulkDataURI".
+
+    Created when parsing a DICOM JSON Model object if a
+    `bulk_data_uri_handler` is available. The handler is not called during
+    parsing - instead it acts as the application-supplied *loader* that is
+    called the first time the value is actually needed, such as when
+    accessing the element's value or decoding pixel data. The class itself
+    performs no I/O (such as HTTP requests); all retrieval is delegated to
+    the loader.
+
+    .. versionadded:: 3.1
+    """
+
+    def __init__(
+        self,
+        tag: str,
+        vr: str,
+        uri: str,
+        loader: Callable[[str, str, str], BulkDataType],
+        path: str = "",
+    ) -> None:
+        """Create a new lazy bulk data value.
+
+        Parameters
+        ----------
+        tag : str
+            The data element's tag in uppercase hex format like
+            ``"7FE00010"``.
+        vr : str
+            The data element's value representation as taken from the JSON
+            representation, may be an unknown VR.
+        uri : str
+            The "BulkDataURI" value used to retrieve the element's value.
+        loader : callable
+            A callable ``loader(tag, vr, uri)`` that returns the actual
+            value of the data element. Only called on :meth:`resolve` or
+            :meth:`retry`, never during parsing, formatting or copying.
+        path : str
+            The path of the element within its (possibly nested) dataset,
+            e.g. ``"(003A,0200)[1] > (5400,1010)"`` for an element in the
+            second item of a sequence.
+        """
+        self.tag = tag
+        self.vr = vr
+        self.uri = uri
+        self.path = path
+        self._loader = loader
+        self._is_resolved = False
+        self._value: BulkDataType = None
+        self._error: Exception | None = None
+
+    @property
+    def is_resolved(self) -> bool:
+        """Return ``True`` if the value has been successfully loaded."""
+        return self._is_resolved
+
+    def resolve(self) -> BulkDataType:
+        """Return the element's value, loading it via the loader if needed.
+
+        The loader is called at most once for a successful load - the
+        result is cached and returned directly on subsequent calls. If a
+        previous load attempt failed, the cached exception is re-raised
+        without calling the loader again; use :meth:`retry` to explicitly
+        attempt the load again.
+
+        Returns
+        -------
+        None, str, int, float or bytes
+            The value returned by the loader.
+
+        Raises
+        ------
+        Exception
+            Whatever exception the loader raised, if the load failed.
+        """
+        if self._is_resolved:
+            return self._value
+
+        if self._error is not None:
+            raise self._error
+
+        try:
+            self._value = self._loader(self.tag, self.vr, self.uri)
+        except Exception as exc:
+            self._error = exc
+            raise
+
+        self._is_resolved = True
+        return self._value
+
+    def retry(self) -> BulkDataType:
+        """Explicitly retry loading the value after a failure.
+
+        Clears any cached failure and calls the loader again. If the value
+        was already loaded successfully, the cached value is returned without
+        calling the loader.
+
+        Returns
+        -------
+        None, str, int, float or bytes
+            The value returned by the loader.
+        """
+        self._error = None
+        return self.resolve()
+
+    def __repr__(self) -> str:
+        """Return a representation without triggering a load."""
+        if self._is_resolved:
+            status = "resolved"
+        elif self._error is not None:
+            status = f"failed ({self._error!r})"
+        else:
+            status = "pending"
+
+        return (
+            f"BulkDataValue(tag={self.tag}, vr={self.vr}, "
+            f"uri={self.uri!r}, path={self.path!r}, status={status})"
+        )
+
+
 class JsonDataElementConverter:
     """Convert from a JSON struct to a :class:`DataElement`.
 
@@ -96,6 +218,7 @@ class JsonDataElementConverter:
         bulk_data_uri_handler: (
             BulkDataHandlerType | Callable[[str], BulkDataType] | None
         ) = None,
+        path: str | None = None,
     ) -> None:
         """Create a new converter instance.
 
@@ -124,12 +247,25 @@ class JsonDataElementConverter:
             corresponding element will have an "empty" value such as
             ``""``, ``b""`` or ``None`` depending on the
             `vr` (i.e. the Value Multiplicity will be 0).
+        path : str or None, optional
+            The path of the element within its (possibly nested) dataset,
+            used for lazily-resolved "BulkDataURI" values. If ``None``
+            (default), the path is built from `tag` alone.
         """
         self.dataset_class = dataset_class
         self.tag = tag
         self.vr = vr
         self.value = value
         self.value_key = value_key
+        if path is None:
+            try:
+                base_tag = Tag(int(tag, 16)) if isinstance(tag, str) else Tag(tag)
+                path = f"({base_tag.group:04X},{base_tag.element:04X})"
+            except (ValueError, TypeError):
+                # An invalid tag will raise later when the element is
+                #   created - don't fail here just to build the path
+                path = str(tag)
+        self.path = path
         self.bulk_data_element_handler: BulkDataHandlerType
 
         handler = bulk_data_uri_handler
@@ -168,7 +304,14 @@ class JsonDataElementConverter:
                 return empty_value_for_VR(self.vr)
 
             val = cast(list[ValueType], self.value)
-            element_value = [self.get_regular_element_value(v) for v in val]
+            if self.vr == VR.SQ:
+                element_value = [
+                    self.get_sequence_item(cast(SQValueType, v), index)
+                    for index, v in enumerate(val)
+                ]
+            else:
+                element_value = [self.get_regular_element_value(v) for v in val]
+
             if len(element_value) == 1 and self.vr != VR.SQ:
                 element_value = element_value[0]
 
@@ -210,7 +353,15 @@ class JsonDataElementConverter:
                 )
                 return empty_value_for_VR(self.vr)
 
-            return self.bulk_data_element_handler(self.tag, self.vr, value)
+            # Return a lazily-resolved value - the handler is only used as
+            #   the loader called when the value is actually needed
+            return BulkDataValue(
+                tag=self.tag,
+                vr=self.vr,
+                uri=value,
+                loader=self.bulk_data_element_handler,
+                path=self.path,
+            )
 
         raise ValueError(
             f"Unknown attribute name '{self.value_key}' for tag {self.tag}"
@@ -256,13 +407,18 @@ class JsonDataElementConverter:
 
         return value
 
-    def get_sequence_item(self, value: SQValueType) -> "Dataset":
+    def get_sequence_item(
+        self, value: SQValueType, index: int | None = None
+    ) -> "Dataset":
         """Return a sequence item for the JSON dict `value`.
 
         Parameters
         ----------
         value : dict or None
             The sequence item from the JSON entry.
+        index : int or None, optional
+            The index of the item within the sequence, used to build the
+            dataset path of lazily-resolved "BulkDataURI" values.
 
         Returns
         -------
@@ -280,12 +436,18 @@ class JsonDataElementConverter:
         ds = self.dataset_class()
 
         value = {} if value is None else value
+        if index is not None:
+            item_path = f"{self.path}[{index}]"
+        else:
+            item_path = self.path
+
         for key, val in value.items():
             if "vr" not in val:
                 raise KeyError(f"Data element '{self.tag}' must have key 'vr'")
 
             vr = val["vr"]
             unique_value_keys = tuple(set(val.keys()) & set(JSON_VALUE_KEYS))
+            element_path = f"{item_path} > ({key[0:4]},{key[4:8]})"
 
             if not unique_value_keys:
                 # data element with no value
@@ -301,6 +463,7 @@ class JsonDataElementConverter:
                     val[value_key],
                     value_key,
                     self.bulk_data_element_handler,
+                    path=element_path,
                 )
             ds.add(elem)
 

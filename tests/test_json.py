@@ -1,4 +1,5 @@
 # Copyright 2008-2019 pydicom authors. See LICENSE file for details.
+import copy
 import json
 import logging
 from unittest import mock
@@ -9,6 +10,7 @@ from pydicom import dcmread
 from pydicom.data import get_testdata_file
 from pydicom.dataelem import DataElement, RawDataElement
 from pydicom.dataset import Dataset
+from pydicom.jsonrep import BulkDataValue
 from pydicom.tag import Tag, BaseTag
 from pydicom.valuerep import PersonName
 
@@ -518,6 +520,275 @@ class TestBinary:
         ds = Dataset().from_json(json.dumps(json_data), bulk_data_reader)
 
         assert b"xyzzy" == ds[0x003A0200].value[0][0x54001010].value
+
+
+class TestLazyBulkData:
+    """Tests for lazily-resolved "BulkDataURI" values."""
+
+    PIXEL_URI = "https://example.com/studies/1/series/2/instances/3/bulk/pixels"
+    WAVE_URI_1 = "https://example.com/bulk/wave1"
+    WAVE_URI_2 = "https://example.com/bulk/wave2"
+
+    def setup_method(self):
+        # A large Pixel Data element and two bulk values nested in a
+        #   sequence, all referenced by "BulkDataURI"
+        self.pixel_bytes = bytes(range(256)) * 2048  # 512 KiB, one frame
+        self.payloads = {
+            self.PIXEL_URI: self.pixel_bytes,
+            self.WAVE_URI_1: b"wave-one",
+            self.WAVE_URI_2: b"wave-two",
+        }
+        self.calls = []
+
+        def counting_loader(tag, vr, uri):
+            self.calls.append((tag, vr, uri))
+            return self.payloads[uri]
+
+        self.loader = counting_loader
+        self.json_data = {
+            "00100010": {"vr": "PN", "Value": [{"Alphabetic": "Doe^John"}]},
+            "00280010": {"vr": "US", "Value": [512]},
+            "00280011": {"vr": "US", "Value": [512]},
+            "00280100": {"vr": "US", "Value": [16]},
+            "00280101": {"vr": "US", "Value": [16]},
+            "00280102": {"vr": "US", "Value": [15]},
+            "00280103": {"vr": "US", "Value": [0]},
+            "00280002": {"vr": "US", "Value": [1]},
+            "00280004": {"vr": "CS", "Value": ["MONOCHROME2"]},
+            "7FE00010": {"vr": "OW", "BulkDataURI": self.PIXEL_URI},
+            "003A0200": {
+                "vr": "SQ",
+                "Value": [
+                    {"54001010": {"vr": "OW", "BulkDataURI": self.WAVE_URI_1}},
+                    {"54001010": {"vr": "OW", "BulkDataURI": self.WAVE_URI_2}},
+                ],
+            },
+        }
+
+    def from_json(self):
+        return Dataset.from_json(
+            json.dumps(self.json_data), bulk_data_uri_handler=self.loader
+        )
+
+    def test_parse_does_not_load(self):
+        ds = self.from_json()
+        assert self.calls == []
+
+        elem = ds[0x7FE00010]
+        assert isinstance(elem._value, BulkDataValue)
+        assert not elem._value.is_resolved
+
+    def test_lazy_value_remembers_identity(self):
+        ds = self.from_json()
+
+        pixel = ds[0x7FE00010]._value
+        assert pixel.tag == "7FE00010"
+        assert pixel.vr == "OW"
+        assert pixel.uri == self.PIXEL_URI
+        assert pixel.path == "(7FE0,0010)"
+
+        item_0 = ds[0x003A0200].value[0][0x54001010]._value
+        item_1 = ds[0x003A0200].value[1][0x54001010]._value
+        assert item_0.uri == self.WAVE_URI_1
+        assert item_0.path == "(003A,0200)[0] > (5400,1010)"
+        assert item_1.uri == self.WAVE_URI_2
+        assert item_1.path == "(003A,0200)[1] > (5400,1010)"
+
+    def test_metadata_operations_do_not_load(self):
+        ds = self.from_json()
+
+        repr(ds)
+        str(ds)
+        repr(ds[0x7FE00010])
+        assert "not loaded" in ds[0x7FE00010].repval
+        len(ds)
+        list(ds)
+        list(ds.keys())
+        [elem.tag for elem in ds]
+        [elem.VR for elem in ds]
+        [elem.is_empty for elem in ds]
+        [elem.VM for elem in ds]
+        copy.deepcopy(ds)
+        ds.walk(lambda dataset, elem: None)
+
+        assert self.calls == []
+
+    def test_trigger_points(self):
+        ds = self.from_json()
+
+        # Accessing a nested bulk value only loads that value, once
+        item_1 = ds[0x003A0200].value[1]
+        assert item_1[0x54001010].value == b"wave-two"
+        assert self.calls == [("54001010", "OW", self.WAVE_URI_2)]
+        assert item_1[0x54001010].value == b"wave-two"
+        assert len(self.calls) == 1
+
+        # The other nested value and Pixel Data are still pending
+        item_0 = ds[0x003A0200].value[0]
+        assert item_0[0x54001010].value == b"wave-one"
+        assert len(self.calls) == 2
+
+        # Accessing Pixel Data loads it exactly once
+        assert ds.PixelData == self.pixel_bytes
+        assert len(self.calls) == 3
+        assert ds.PixelData == self.pixel_bytes
+        assert ds[0x7FE00010].value == self.pixel_bytes
+        assert len(self.calls) == 3
+
+    def test_pixel_array_triggers_single_load(self):
+        pytest.importorskip("numpy")
+        from pydicom.dataset import FileMetaDataset
+        from pydicom.uid import ExplicitVRLittleEndian
+
+        ds = self.from_json()
+        ds.file_meta = FileMetaDataset()
+        ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+
+        arr = ds.pixel_array
+        assert len(self.calls) == 1
+        assert self.calls[0][2] == self.PIXEL_URI
+        assert arr.shape == (512, 512)
+        assert arr[1, 1] == 770  # bytes 02 03 little endian
+
+        ds.pixel_array
+        assert len(self.calls) == 1
+
+    def test_json_roundtrip_keeps_uri(self):
+        ds = self.from_json()
+
+        # Exporting to JSON keeps the original URI and does not load
+        json_dict = ds.to_json_dict()
+        assert json_dict["7FE00010"] == {"vr": "OW", "BulkDataURI": self.PIXEL_URI}
+        nested = json_dict["003A0200"]["Value"]
+        assert nested[0]["54001010"] == {"vr": "OW", "BulkDataURI": self.WAVE_URI_1}
+        assert nested[1]["54001010"] == {"vr": "OW", "BulkDataURI": self.WAVE_URI_2}
+        assert self.calls == []
+
+        # A round-trip stays lazy and still resolves on demand
+        ds2 = Dataset.from_json(json_dict, bulk_data_uri_handler=self.loader)
+        assert self.calls == []
+        assert ds2.PixelData == self.pixel_bytes
+        assert len(self.calls) == 1
+
+    def test_inline_binary_after_resolution(self):
+        ds = self.from_json()
+
+        # Once the value has been resolved it is serialized normally
+        assert ds[0x003A0200].value[0][0x54001010].value == b"wave-one"
+        json_dict = ds.to_json_dict()
+        nested = json_dict["003A0200"]["Value"]
+        assert nested[0]["54001010"] == {
+            "vr": "OW",
+            "InlineBinary": "d2F2ZS1vbmU=",
+        }
+        # Unresolved values still keep their URI
+        assert json_dict["7FE00010"] == {"vr": "OW", "BulkDataURI": self.PIXEL_URI}
+        assert len(self.calls) == 1
+
+    def test_save_as_writes_real_bytes(self, tmp_path):
+        from pydicom.dataset import FileMetaDataset
+        from pydicom.uid import ExplicitVRLittleEndian, generate_uid
+
+        ds = self.from_json()
+        ds.SOPClassUID = generate_uid()
+        ds.SOPInstanceUID = generate_uid()
+        ds.file_meta = FileMetaDataset()
+        ds.file_meta.MediaStorageSOPClassUID = ds.SOPClassUID
+        ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+        ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+
+        path = tmp_path / "lazy.dcm"
+        ds.save_as(path, enforce_file_format=True)
+        # All three bulk values were loaded exactly once for writing
+        assert len(self.calls) == 3
+
+        # The file contains the actual bytes, not a placeholder
+        raw = path.read_bytes()
+        assert self.pixel_bytes in raw
+        assert b"BulkDataValue" not in raw
+        assert b"https://example.com" not in raw
+
+        ds2 = dcmread(path)
+        assert ds2.PixelData == self.pixel_bytes
+        assert ds2[0x003A0200].value[0][0x54001010].value == b"wave-one"
+        assert ds2[0x003A0200].value[1][0x54001010].value == b"wave-two"
+
+    def test_failure_is_cached_and_retry_is_explicit(self):
+        attempts = []
+
+        def failing_loader(tag, vr, uri):
+            attempts.append(uri)
+            raise OSError("connection failed")
+
+        ds = Dataset.from_json(
+            json.dumps(self.json_data), bulk_data_uri_handler=failing_loader
+        )
+
+        with pytest.raises(OSError, match="connection failed"):
+            ds.PixelData
+        assert attempts == [self.PIXEL_URI]
+
+        # A failed load is cached - no implicit retry on the next access
+        with pytest.raises(OSError, match="connection failed"):
+            ds.PixelData
+        assert attempts == [self.PIXEL_URI]
+
+        lazy = ds[0x7FE00010]._value
+        assert isinstance(lazy, BulkDataValue)
+        assert not lazy.is_resolved
+
+        # The caller may explicitly retry
+        def working_loader(tag, vr, uri):
+            attempts.append(uri)
+            return self.pixel_bytes
+
+        lazy._loader = working_loader
+        assert lazy.retry() == self.pixel_bytes
+        assert attempts == [self.PIXEL_URI, self.PIXEL_URI]
+        assert ds.PixelData == self.pixel_bytes
+        assert len(attempts) == 2
+
+    def test_empty_binary(self):
+        def empty_loader(tag, vr, uri):
+            return b""
+
+        ds = Dataset.from_json(
+            json.dumps(self.json_data), bulk_data_uri_handler=empty_loader
+        )
+        elem = ds[0x7FE00010]
+        assert elem.value == b""
+        assert elem.is_empty
+        # The empty result is cached as a successful load
+        assert ds[0x7FE00010].value == b""
+
+    def test_unknown_vr(self):
+        json_data = {
+            "00191001": {"vr": "ZX", "BulkDataURI": "https://example.com/x"},
+        }
+        ds = Dataset.from_json(json_data, bulk_data_uri_handler=self.loader)
+        elem = ds[0x00191001]
+        assert elem.VR == "ZX"
+        assert isinstance(elem._value, BulkDataValue)
+        assert self.calls == []
+
+        # An unknown VR round-trips as the original URI and resolves as-is
+        assert ds.to_json_dict() == {
+            "00191001": {"vr": "ZX", "BulkDataURI": "https://example.com/x"}
+        }
+        assert self.calls == []
+
+        self.payloads["https://example.com/x"] = b"unknown-bytes"
+        assert elem.value == b"unknown-bytes"
+        assert self.calls == [("00191001", "ZX", "https://example.com/x")]
+
+    def test_bulk_data_value_repr_does_not_load(self):
+        ds = self.from_json()
+        lazy = ds[0x7FE00010]._value
+        r = repr(lazy)
+        assert "pending" in r
+        assert self.PIXEL_URI in r
+        assert "(7FE0,0010)" in r
+        assert self.calls == []
 
 
 class TestNumeric:

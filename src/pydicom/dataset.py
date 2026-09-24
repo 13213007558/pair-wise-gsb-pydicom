@@ -3154,6 +3154,14 @@ class Dataset:  # noqa: PLW1641
             ``""``, ``b""`` or ``None`` depending on the `vr` (i.e. the
             Value Multiplicity will be 0).
 
+            .. versionchanged:: 3.1
+
+                The handler is no longer called while parsing. Instead the
+                element's value is set to a
+                :class:`~pydicom.jsonrep.BulkDataValue` that only calls the
+                handler when the value is actually needed, such as when
+                accessing the element's value or decoding pixel data.
+
         Returns
         -------
         Dataset

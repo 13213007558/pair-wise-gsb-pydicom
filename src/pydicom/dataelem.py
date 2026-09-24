@@ -27,7 +27,7 @@ from pydicom.datadict import (
     repeater_has_tag,
 )
 from pydicom.hooks import hooks
-from pydicom.jsonrep import JsonDataElementConverter, BulkDataType
+from pydicom.jsonrep import JsonDataElementConverter, BulkDataType, BulkDataValue
 from pydicom.misc import warn_and_log
 from pydicom.multival import MultiValue
 from pydicom.tag import Tag, BaseTag, _LUT_DESCRIPTOR_TAGS
@@ -228,6 +228,7 @@ class DataElement:  # noqa: PLW1641
             VR == VR_.UN
             and not tag.is_private
             and config.replace_un_with_known_vr
+            and not isinstance(value, BulkDataValue)
             and (is_undefined_length or value is None or len(value) < 0xFFFF)
         ):
             try:
@@ -266,6 +267,7 @@ class DataElement:  # noqa: PLW1641
             | Callable[[str], BulkDataType]
             | None
         ) = None,
+        path: str | None = None,
     ) -> "DataElement":
         """Return a :class:`DataElement` from a DICOM JSON Model attribute
         object.
@@ -293,6 +295,10 @@ class DataElement:  # noqa: PLW1641
             corresponding element will have an "empty" value such as
             ``""``, ``b""`` or ``None`` depending on the `vr` (i.e. the
             Value Multiplicity will be 0).
+        path : str or None, optional
+            The path of the element within its (possibly nested) dataset,
+            used for lazily-resolved "BulkDataURI" values. If ``None``
+            (default), the path is built from `tag` alone.
 
         Returns
         -------
@@ -300,9 +306,20 @@ class DataElement:  # noqa: PLW1641
         """
         # TODO: test wado-rs retrieve wrapper
         converter = JsonDataElementConverter(
-            dataset_class, tag, vr, value, value_key, bulk_data_uri_handler
+            dataset_class,
+            tag,
+            vr,
+            value,
+            value_key,
+            bulk_data_uri_handler,
+            path=path,
         )
         elem_value = converter.get_element_values()
+
+        if isinstance(elem_value, BulkDataValue):
+            # A lazily-resolved bulk data value is stored as-is and only
+            #   loaded when the element's value is actually accessed
+            return cls(tag=tag, value=elem_value, VR=vr, already_converted=True)
 
         if (
             vr == VR_.UN
@@ -348,6 +365,14 @@ class DataElement:  # noqa: PLW1641
             Mapping representing a JSON encoded data element as ``{str: Any}``.
         """
         json_element: dict[str, Any] = {"vr": self.VR}
+        if isinstance(self._value, BulkDataValue):
+            # An unresolved bulk data value keeps its original "BulkDataURI"
+            #   so that a JSON round-trip does not trigger a download; once
+            #   the value has been resolved it is serialized normally
+            #   (e.g. as "InlineBinary")
+            json_element["BulkDataURI"] = self._value.uri
+            return json_element
+
         if self.VR in (BYTES_VR | AMBIGUOUS_VR) - {VR_.US_SS}:
             if not self.is_empty:
                 binary_value = self.value
@@ -465,10 +490,22 @@ class DataElement:  # noqa: PLW1641
         Any
             The element's value.
         """
+        if isinstance(self._value, BulkDataValue):
+            # Resolve the lazily-loaded bulk data value - on success the
+            #   resolved value replaces the BulkDataValue so the loader is
+            #   only called once; on failure the exception is propagated
+            #   and the BulkDataValue (with the cached failure) is kept
+            self.value = self._value.resolve()
+
         return self._value
 
     @value.setter
     def value(self, val: Any) -> None:
+        # Lazily-resolved bulk data values are stored as-is
+        if isinstance(val, BulkDataValue):
+            self._value = val
+            return
+
         # O* elements set using a buffer object
         if isinstance(val, BufferedIOBase):
             if self.VR not in BUFFERABLE_VRS:
@@ -513,6 +550,10 @@ class DataElement:  # noqa: PLW1641
         if self.VR == VR_.SQ:
             return 1
 
+        if isinstance(self._value, BulkDataValue):
+            # Avoid resolving a lazily-loaded bulk data value
+            return 1
+
         if self.value is None:
             return 0
 
@@ -542,6 +583,11 @@ class DataElement:  # noqa: PLW1641
     @property
     def is_empty(self) -> bool:
         """Return ``True`` if the element has no value."""
+        if isinstance(self._value, BulkDataValue):
+            # A lazily-loaded bulk data value is not considered empty and
+            #   is not resolved just to check for emptiness
+            return False
+
         if self.VR == VR_.SQ:
             return not bool(self.value)
 
@@ -725,6 +771,10 @@ class DataElement:  # noqa: PLW1641
     @property
     def repval(self) -> str:
         """Return a :class:`str` representation of the element's value."""
+        if isinstance(self._value, BulkDataValue):
+            # Don't resolve a lazily-loaded bulk data value just to print it
+            return f"Bulk data (not loaded): {self._value.uri}"
+
         if self.is_buffered:
             # in case the buffer is a stream and non-seekable we don't want
             # to consume any bytes
