@@ -56,6 +56,9 @@ Fixes
 Enhancements
 ------------
 * Python 3.12, 3.13 and 3.14 are now supported.
+* Added :func:`~pydicom.pixels.crop` for cropping uncompressed single frame and
+  enhanced multi-frame grayscale pixel data while keeping the patient coordinate
+  system location of the cropped image correct.
 * Added the option to pass a ``bool`` ndarray to :func:`~pydicom.pixels.set_pixel_data`
   to store with *Bits Allocated* of ``1`` using bit-packing (:issue:`2141`).
 * Added a check to :meth:`~pydicom.dataset.Dataset.set_pixel_data` to ensure that the

@@ -22,6 +22,7 @@ Image processing functions
    apply_windowing
    convert_color_space
    create_icc_transform
+   crop
 
 
 Utility functions
