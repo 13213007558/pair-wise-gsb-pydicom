@@ -3133,6 +3133,7 @@ class Dataset:  # noqa: PLW1641
             | Callable[[str], None | str | int | float | bytes]
             | None
         ) = None,
+        lazy_bulk_data: bool = False,
     ) -> "Dataset":
         """Return a :class:`Dataset` from a DICOM JSON Model object.
 
@@ -3153,6 +3154,17 @@ class Dataset:  # noqa: PLW1641
             corresponding element will have an "empty" value such as
             ``""``, ``b""`` or ``None`` depending on the `vr` (i.e. the
             Value Multiplicity will be 0).
+        lazy_bulk_data : bool, optional
+            If ``True``, elements with a "BulkDataURI" get a
+            :class:`~pydicom.jsonrep.LazyBulkData` placeholder as their
+            value instead of retrieving the bulk data immediately. The
+            actual value is only retrieved using the
+            `bulk_data_uri_handler` when the element's value is accessed,
+            e.g. when writing the dataset to a DICOM file. Copying the
+            dataset, iterating over its elements and exporting it back to
+            JSON do not retrieve the bulk data, and an unresolved
+            "BulkDataURI" is preserved when exporting to JSON. If
+            ``False`` (default) the bulk data is retrieved during decoding.
 
         Returns
         -------
@@ -3178,7 +3190,13 @@ class Dataset:  # noqa: PLW1641
                 value_key = unique_value_keys[0]
                 value = mapping[value_key]
             data_element = DataElement.from_json(
-                cls, tag, vr, value, value_key, bulk_data_uri_handler
+                cls,
+                tag,
+                vr,
+                value,
+                value_key,
+                bulk_data_uri_handler,
+                lazy_bulk_data=lazy_bulk_data,
             )
             dataset.add(data_element)
         return dataset

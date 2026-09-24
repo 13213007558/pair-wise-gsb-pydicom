@@ -27,7 +27,7 @@ from pydicom.datadict import (
     repeater_has_tag,
 )
 from pydicom.hooks import hooks
-from pydicom.jsonrep import JsonDataElementConverter, BulkDataType
+from pydicom.jsonrep import JsonDataElementConverter, BulkDataType, LazyBulkData
 from pydicom.misc import warn_and_log
 from pydicom.multival import MultiValue
 from pydicom.tag import Tag, BaseTag, _LUT_DESCRIPTOR_TAGS
@@ -266,6 +266,8 @@ class DataElement:  # noqa: PLW1641
             | Callable[[str], BulkDataType]
             | None
         ) = None,
+        lazy_bulk_data: bool = False,
+        bulk_data_path: tuple[tuple[str, int], ...] = (),
     ) -> "DataElement":
         """Return a :class:`DataElement` from a DICOM JSON Model attribute
         object.
@@ -293,6 +295,18 @@ class DataElement:  # noqa: PLW1641
             corresponding element will have an "empty" value such as
             ``""``, ``b""`` or ``None`` depending on the `vr` (i.e. the
             Value Multiplicity will be 0).
+        lazy_bulk_data : bool, optional
+            If ``True``, an element with a "BulkDataURI" gets a
+            :class:`~pydicom.jsonrep.LazyBulkData` placeholder as its value
+            instead of retrieving the bulk data immediately. The actual
+            value is only retrieved using the `bulk_data_uri_handler` when
+            the element's value is accessed. If ``False`` (default) the
+            bulk data is retrieved during decoding.
+        bulk_data_path : tuple[tuple[str, int], ...], optional
+            The path of enclosing sequence items as ``(tag, item index)``
+            tuples, used for the :attr:`~pydicom.jsonrep.LazyBulkData.path`
+            of lazily decoded bulk data. Empty for top-level elements
+            (default).
 
         Returns
         -------
@@ -300,9 +314,21 @@ class DataElement:  # noqa: PLW1641
         """
         # TODO: test wado-rs retrieve wrapper
         converter = JsonDataElementConverter(
-            dataset_class, tag, vr, value, value_key, bulk_data_uri_handler
+            dataset_class,
+            tag,
+            vr,
+            value,
+            value_key,
+            bulk_data_uri_handler,
+            lazy_bulk_data,
+            bulk_data_path,
         )
         elem_value = converter.get_element_values()
+
+        if isinstance(elem_value, LazyBulkData):
+            # Store the placeholder as-is, the bulk data will be retrieved
+            #   when the element's value is accessed
+            return cls(tag=tag, value=elem_value, VR=vr, already_converted=True)
 
         if (
             vr == VR_.UN
@@ -348,6 +374,12 @@ class DataElement:  # noqa: PLW1641
             Mapping representing a JSON encoded data element as ``{str: Any}``.
         """
         json_element: dict[str, Any] = {"vr": self.VR}
+        if isinstance(self._value, LazyBulkData) and not self._value.is_resolved:
+            # Unresolved lazily-decoded bulk data - keep the "BulkDataURI"
+            #   rather than retrieving the value
+            json_element["BulkDataURI"] = self._value.uri
+            return json_element
+
         if self.VR in (BYTES_VR | AMBIGUOUS_VR) - {VR_.US_SS}:
             if not self.is_empty:
                 binary_value = self.value
@@ -465,6 +497,12 @@ class DataElement:  # noqa: PLW1641
         Any
             The element's value.
         """
+        if isinstance(self._value, LazyBulkData):
+            # Retrieve lazily-decoded bulk data and replace the placeholder
+            #   with the actual value; a failed retrieval raises and leaves
+            #   the placeholder in place so it can be retried
+            self.value = self._value.resolve()
+
         return self._value
 
     @value.setter

@@ -1,6 +1,8 @@
 # Copyright 2008-2019 pydicom authors. See LICENSE file for details.
+import copy
 import json
 import logging
+from io import BytesIO
 from unittest import mock
 
 import pytest
@@ -9,6 +11,8 @@ from pydicom import dcmread
 from pydicom.data import get_testdata_file
 from pydicom.dataelem import DataElement, RawDataElement
 from pydicom.dataset import Dataset
+from pydicom.filewriter import dcmwrite
+from pydicom.jsonrep import LazyBulkData
 from pydicom.tag import Tag, BaseTag
 from pydicom.valuerep import PersonName
 
@@ -518,6 +522,216 @@ class TestBinary:
         ds = Dataset().from_json(json.dumps(json_data), bulk_data_reader)
 
         assert b"xyzzy" == ds[0x003A0200].value[0][0x54001010].value
+
+
+class TestLazyBulkData:
+    """Tests for lazily decoded bulk data from a "BulkDataURI"."""
+
+    @staticmethod
+    def counting_handler(value=b"xyzzy", fail_with=None):
+        """Return a bulk data URI handler that counts and records calls."""
+        calls = []
+
+        def handler(tag, vr, uri):
+            calls.append((tag, vr, uri))
+            if fail_with is not None:
+                raise fail_with
+            return value
+
+        handler.calls = calls
+        return handler
+
+    def test_no_retrieval_on_decode(self):
+        handler = self.counting_handler()
+        json_data = {"00091002": {"vr": "OB", "BulkDataURI": "https://a.dummy.url"}}
+        ds = Dataset.from_json(json.dumps(json_data), handler, lazy_bulk_data=True)
+
+        assert handler.calls == []
+        assert 0x00091002 in ds
+        bulk = ds[0x00091002]._value
+        assert isinstance(bulk, LazyBulkData)
+        assert not bulk.is_resolved
+
+    def test_value_access_resolves_once(self):
+        handler = self.counting_handler()
+        json_data = {"00091002": {"vr": "OB", "BulkDataURI": "https://a.dummy.url"}}
+        ds = Dataset.from_json(json.dumps(json_data), handler, lazy_bulk_data=True)
+
+        assert b"xyzzy" == ds[0x00091002].value
+        assert [("00091002", "OB", "https://a.dummy.url")] == handler.calls
+        # subsequent accesses use the cached value
+        assert b"xyzzy" == ds[0x00091002].value
+        assert 1 == len(handler.calls)
+
+    def test_copy_and_iteration_do_not_resolve(self):
+        handler = self.counting_handler()
+        json_data = {
+            "00091002": {"vr": "OB", "BulkDataURI": "https://a.dummy.url"},
+            "00100010": {"vr": "PN", "Value": [{"Alphabetic": "CITIZEN^Joan"}]},
+        }
+        ds = Dataset.from_json(json.dumps(json_data), handler, lazy_bulk_data=True)
+
+        copied = copy.deepcopy(ds)
+        for elem in ds:
+            pass
+        ds.walk(lambda dataset, elem: None)
+
+        assert handler.calls == []
+        # the copy resolves independently of the original
+        assert b"xyzzy" == copied[0x00091002].value
+        assert 1 == len(handler.calls)
+        assert not ds[0x00091002]._value.is_resolved
+
+    def test_to_json_keeps_uri_without_resolving(self):
+        handler = self.counting_handler()
+        json_data = {
+            "00091002": {"vr": "OB", "BulkDataURI": "https://a.dummy.url"},
+            "003A0200": {
+                "vr": "SQ",
+                "Value": [
+                    {
+                        "54001010": {
+                            "vr": "OW",
+                            "BulkDataURI": "https://b.dummy.url",
+                        }
+                    }
+                ],
+            },
+        }
+        ds = Dataset.from_json(json.dumps(json_data), handler, lazy_bulk_data=True)
+
+        exported = ds.to_json_dict()
+        assert handler.calls == []
+        assert {"vr": "OB", "BulkDataURI": "https://a.dummy.url"} == (
+            exported["00091002"]
+        )
+        assert {"vr": "OW", "BulkDataURI": "https://b.dummy.url"} == (
+            exported["003A0200"]["Value"][0]["54001010"]
+        )
+
+        # a dataset decoded from the exported JSON is still unresolved
+        ds2 = Dataset.from_json(exported, handler, lazy_bulk_data=True)
+        assert handler.calls == []
+        assert not ds2[0x00091002]._value.is_resolved
+
+    def test_nested_sequence_item_path(self):
+        handler = self.counting_handler()
+        json_data = {
+            "003A0200": {
+                "vr": "SQ",
+                "Value": [
+                    {},
+                    {
+                        "0040A730": {
+                            "vr": "SQ",
+                            "Value": [
+                                {
+                                    "54001010": {
+                                        "vr": "OW",
+                                        "BulkDataURI": "https://b.dummy.url",
+                                    }
+                                }
+                            ],
+                        }
+                    },
+                ],
+            }
+        }
+        ds = Dataset.from_json(json.dumps(json_data), handler, lazy_bulk_data=True)
+        assert handler.calls == []
+
+        elem = ds[0x003A0200].value[1][0x0040A730].value[0][0x54001010]
+        bulk = elem._value
+        assert isinstance(bulk, LazyBulkData)
+        assert "54001010" == bulk.tag
+        assert "OW" == bulk.vr
+        assert "https://b.dummy.url" == bulk.uri
+        assert (("003A0200", 1), ("0040A730", 0)) == bulk.path
+
+        assert b"xyzzy" == elem.value
+        assert [("54001010", "OW", "https://b.dummy.url")] == handler.calls
+
+    def test_resolved_empty_value(self):
+        handler = self.counting_handler(value=b"")
+        json_data = {"00091002": {"vr": "OB", "BulkDataURI": "https://a.dummy.url"}}
+        ds = Dataset.from_json(json.dumps(json_data), handler, lazy_bulk_data=True)
+
+        # the element exists but is not yet resolved
+        assert 0x00091002 in ds
+        assert handler.calls == []
+        assert not ds[0x00091002]._value.is_resolved
+
+        # after resolution the value is empty, but the element is still there
+        assert b"" == ds[0x00091002].value
+        assert 1 == len(handler.calls)
+        assert 0x00091002 in ds
+
+        # an element that was never in the dataset is absent
+        assert 0x00091003 not in ds
+
+    def test_failed_resolution_is_not_cached(self):
+        handler = self.counting_handler(fail_with=ConnectionError("offline"))
+        json_data = {"00091002": {"vr": "OB", "BulkDataURI": "https://a.dummy.url"}}
+        ds = Dataset.from_json(json.dumps(json_data), handler, lazy_bulk_data=True)
+
+        with pytest.raises(ConnectionError, match="offline"):
+            ds[0x00091002].value
+
+        # the failure is not cached as an empty value
+        assert 0x00091002 in ds
+        bulk = ds[0x00091002]._value
+        assert isinstance(bulk, LazyBulkData)
+        assert not bulk.is_resolved
+
+        # an explicit retry re-attempts the retrieval
+        handler = self.counting_handler()
+        bulk._handler = handler
+        assert b"xyzzy" == bulk.retry()
+        assert 1 == len(handler.calls)
+        assert bulk.is_resolved
+        assert b"xyzzy" == ds[0x00091002].value
+
+    def test_same_uri_different_tags(self):
+        handler = self.counting_handler()
+        json_data = {
+            "00091002": {"vr": "OB", "BulkDataURI": "https://a.dummy.url"},
+            "00091004": {"vr": "OW", "BulkDataURI": "https://a.dummy.url"},
+        }
+        ds = Dataset.from_json(json.dumps(json_data), handler, lazy_bulk_data=True)
+
+        assert b"xyzzy" == ds[0x00091002].value
+        assert b"xyzzy" == ds[0x00091004].value
+        # the handler sees the context of each element separately
+        assert [
+            ("00091002", "OB", "https://a.dummy.url"),
+            ("00091004", "OW", "https://a.dummy.url"),
+        ] == handler.calls
+
+    def test_writing_dicom_resolves(self):
+        handler = self.counting_handler(value=b"wxyz")
+        json_data = {"00091002": {"vr": "OB", "BulkDataURI": "https://a.dummy.url"}}
+        ds = Dataset.from_json(json.dumps(json_data), handler, lazy_bulk_data=True)
+        assert handler.calls == []
+
+        buffer = BytesIO()
+        dcmwrite(buffer, ds, implicit_vr=False, little_endian=True)
+        assert 1 == len(handler.calls)
+
+        ds2 = dcmread(buffer, force=True)
+        assert b"wxyz" == ds2[0x00091002].value
+
+    def test_no_handler_raises_on_resolve(self):
+        json_data = {"00091002": {"vr": "OB", "BulkDataURI": "https://a.dummy.url"}}
+        ds = Dataset.from_json(json.dumps(json_data), lazy_bulk_data=True)
+
+        msg = "no bulk data URI handler available"
+        with pytest.raises(ValueError, match=msg):
+            ds[0x00091002].value
+
+        # the URI is still preserved when exporting to JSON
+        assert {"vr": "OB", "BulkDataURI": "https://a.dummy.url"} == (
+            ds.to_json_dict()["00091002"]
+        )
 
 
 class TestNumeric:
