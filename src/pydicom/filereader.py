@@ -11,7 +11,7 @@ import zlib
 from pydicom import config
 from pydicom.charset import default_encoding, convert_encodings
 from pydicom.config import logger
-from pydicom.datadict import _dictionary_vr_fast
+from pydicom.datadict import _dictionary_vr_fast, keyword_for_tag
 from pydicom.dataelem import (
     DataElement,
     RawDataElement,
@@ -48,6 +48,103 @@ ENCODED_VR = {vr.encode(default_encoding) for vr in VR_}
 # ruff: noqa: C901, PLR0912, PLR0915
 
 
+class UnexpectedEOFError(EOFError):
+    """Raised when the end of the file is reached before the data selected
+    by a nested tag path has been fully read.
+
+    Attributes
+    ----------
+    path : str
+        The tag path that was being read when the file ended, e.g.
+        ``"ReferencedImageSequence[1].ReferencedSOPInstanceUID"``.
+    offset : int
+        The file offset at which the read failed.
+    at_element_boundary : bool
+        ``True`` if the file ended cleanly at a data element boundary,
+        ``False`` if it ended in the middle of an element.
+    """
+
+    def __init__(
+        self, path: str, offset: int, at_element_boundary: bool = False
+    ) -> None:
+        self.path = path
+        self.offset = offset
+        self.at_element_boundary = at_element_boundary
+        location = path or "<top-level dataset>"
+        super().__init__(
+            f"Unexpected end of file at offset 0x{offset:08X} "
+            f"while reading {location}"
+        )
+
+
+class _TagFilter:
+    """Internal filter describing which elements to read at one dataset
+    level, including nested selections within sequences."""
+
+    __slots__ = ("tags", "sequences")
+
+    def __init__(self) -> None:
+        # leaf tags to be read at this level
+        self.tags: set[int] = set()
+        # sequence tag -> list of (item selector, sub-filter); a selector of
+        #   None matches all items, an int matches only that item index
+        self.sequences: dict[int, list[tuple[int | None, "_TagFilter"]]] = {}
+
+
+def _path_join(parent: str, tag: int, index: int | None = None) -> str:
+    """Return a human readable tag path for `tag` appended to `parent`."""
+    name = keyword_for_tag(tag) or f"({tag >> 16:04X},{tag & 0xFFFF:04X})"
+    if index is not None:
+        name = f"{name}[{index}]"
+    return f"{parent}.{name}" if parent else name
+
+
+def _add_tag_path(tag_filter: _TagFilter, path: tuple[Any, ...]) -> None:
+    """Add a nested tag path to `tag_filter`.
+
+    A tag path is a tuple of alternating tags and item selectors ending
+    with a leaf tag, e.g. ``("ReferencedImageSequence", "*",
+    "ReferencedSOPInstanceUID")``. An item selector is either a
+    non-negative :class:`int` (the index of a single sequence item) or
+    ``"*"`` (all items, keeping their original order).
+    """
+    if len(path) < 3 or not len(path) % 2:
+        raise ValueError(
+            "A nested tag path must consist of at least 3 and an odd number "
+            "of components (tag, item selector, ..., leaf tag), got "
+            f"{path!r}"
+        )
+    node = tag_filter
+    for i in range(0, len(path) - 1, 2):
+        sq_tag = int(Tag(path[i]))
+        selector = path[i + 1]
+        if selector != "*" and (
+            not isinstance(selector, int) or isinstance(selector, bool) or selector < 0
+        ):
+            raise ValueError(
+                "Item selectors in a tag path must be non-negative integers "
+                f"or '*' for all items, got {selector!r}"
+            )
+        sub_filter = _TagFilter()
+        node.sequences.setdefault(sq_tag, []).append(
+            (None if selector == "*" else selector, sub_filter)
+        )
+        node = sub_filter
+    node.tags.add(int(Tag(path[-1])))
+
+
+def _merged_filter(filters: list[_TagFilter]) -> _TagFilter:
+    """Return the union of several sub-filters applying to the same item."""
+    if len(filters) == 1:
+        return filters[0]
+    merged = _TagFilter()
+    for sub in filters:
+        merged.tags.update(sub.tags)
+        for tag, seq_filters in sub.sequences.items():
+            merged.sequences.setdefault(tag, []).extend(seq_filters)
+    return merged
+
+
 def data_element_generator(
     fp: BinaryIO,
     is_implicit_VR: bool,
@@ -56,6 +153,9 @@ def data_element_generator(
     defer_size: int | str | float | None = None,
     encoding: str | MutableSequence[str] = default_encoding,
     specific_tags: list[BaseTag | int] | None = None,
+    tag_filter: _TagFilter | None = None,
+    _path: str = "",
+    _end_tell: int | None = None,
 ) -> Iterator[RawDataElement | DataElement]:
     """Create a generator to efficiently return the raw data elements.
 
@@ -83,6 +183,17 @@ def data_element_generator(
         Encoding scheme
     specific_tags : list or None
         See :func:`dcmread` for parameter info.
+    tag_filter : _TagFilter or None
+        Internal filter used for nested tag path selection, see
+        :func:`dcmread` for parameter info. Mutually exclusive with
+        `specific_tags`.
+    _path : str
+        Tag path of the dataset being read, used for error reporting.
+    _end_tell : int or None
+        If used, the file position at which the current (defined length)
+        dataset ends. The generator returns once this position is reached,
+        even if no further elements are yielded. Only needed with
+        `tag_filter`, where skipped elements yield nothing.
 
     Yields
     -------
@@ -130,15 +241,26 @@ def data_element_generator(
     debugging = config.debugging
     defer_size = size_in_bytes(defer_size)
 
-    tag_set: set[int] = {tag for tag in specific_tags} if specific_tags else set()
-    has_tag_set = bool(tag_set)
+    if tag_filter is not None:
+        tag_set = set(tag_filter.tags)
+        seq_filters = tag_filter.sequences
+    else:
+        tag_set = {tag for tag in specific_tags} if specific_tags else set()
+        seq_filters = {}
+    has_tag_set = bool(tag_set) or tag_filter is not None
     if has_tag_set:
         tag_set.add(0x00080005)  # Specific Character Set
 
     while True:
         # VR: str | None
         # Read tag, VR, length, get ready to read value
+        if _end_tell is not None and fp_tell() >= _end_tell:
+            return  # end of a defined length dataset
         if len(bytes_read := fp_read(8)) < 8:
+            if tag_filter is not None:
+                raise UnexpectedEOFError(
+                    _path, fp_tell(), at_element_boundary=not bytes_read
+                )
             return  # at end of file
 
         if debugging:
@@ -226,7 +348,37 @@ def data_element_generator(
             # don't defer loading of Specific Character Set value as it is
             # needed immediately to get the character encoding for other tags
             if has_tag_set and tag not in tag_set:
-                # skip the tag if not in specific tags
+                if tag in seq_filters:
+                    # Descend into a defined length sequence, reading only
+                    #   the selected sub-elements
+                    if vr is None:
+                        try:
+                            is_sq = _dictionary_vr_fast(TupleTag((group, elem))) == "SQ"
+                        except KeyError:
+                            # private tag - the declared path implies a SQ
+                            is_sq = True
+                    else:
+                        is_sq = vr == VR_.SQ
+                    if is_sq:
+                        seq = read_sequence_filtered(
+                            fp,
+                            is_implicit_VR,
+                            is_little_endian,
+                            length,
+                            encoding,
+                            seq_filters[tag],
+                            path=_path_join(_path, tag),
+                        )
+                        yield DataElement(
+                            BaseTag(tag),
+                            VR_.SQ,
+                            seq,
+                            value_tell,
+                            is_undefined_length=False,
+                        )
+                        continue
+                # skip the tag if not in specific tags - seek past its
+                #   value without reading it into memory
                 fp_seek(fp_tell() + length)
                 continue
 
@@ -248,6 +400,10 @@ def data_element_generator(
                     if length > 0
                     else cast(bytes | None, empty_value_for_VR(vr, raw=True))
                 )
+                if tag_filter is not None and length > 0:
+                    bytes_read_value = cast(bytes, value)
+                    if len(bytes_read_value) < length:
+                        raise UnexpectedEOFError(_path_join(_path, tag), value_tell)
                 if debugging:
                     dotdot = "..." if length > 20 else "   "
                     displayed_value = value[:20] if value else b""
@@ -305,12 +461,42 @@ def data_element_generator(
                         f"{fp_tell():08X}: Reading/parsing undefined length sequence"
                     )
 
+                if has_tag_set and tag not in tag_set:
+                    if tag in seq_filters:
+                        # Descend into the sequence, reading only the
+                        #   selected sub-elements
+                        seq = read_sequence_filtered(
+                            fp,
+                            is_implicit_VR,
+                            is_little_endian,
+                            length,
+                            encoding,
+                            seq_filters[tag],
+                            path=_path_join(_path, tag),
+                        )
+                        yield DataElement(
+                            BaseTag(tag),
+                            vr,
+                            seq,
+                            value_tell,
+                            is_undefined_length=True,
+                        )
+                    else:
+                        # Skip over the sequence items and the Sequence
+                        #   Delimitation Item without reading the content
+                        try:
+                            _skip_undefined_length_sequence(
+                                fp, is_implicit_VR, is_little_endian
+                            )
+                        except EOFError:
+                            raise UnexpectedEOFError(
+                                _path_join(_path, tag), fp_tell()
+                            ) from None
+                    continue
+
                 seq = read_sequence(
                     fp, is_implicit_VR, is_little_endian, length, encoding
                 )
-                if has_tag_set and tag not in tag_set:
-                    continue
-
                 yield DataElement(
                     BaseTag(tag), vr, seq, value_tell, is_undefined_length=True
                 )
@@ -318,14 +504,20 @@ def data_element_generator(
                 if debugging:
                     logger_debug("Reading undefined length data element")
 
+                if has_tag_set and tag not in tag_set:
+                    # Skip over the items and the Sequence Delimitation
+                    #   Item without reading the content into memory
+                    try:
+                        _skip_undefined_length_value(fp, is_little_endian)
+                    except EOFError:
+                        raise UnexpectedEOFError(
+                            _path_join(_path, tag), fp_tell()
+                        ) from None
+                    continue
+
                 value = read_undefined_length_value(
                     fp, is_little_endian, SequenceDelimiterTag, defer_size
                 )
-
-                # tags with undefined length are skipped after read
-                if has_tag_set and tag not in tag_set:
-                    continue
-
                 yield RawDataElement(
                     BaseTag(tag),
                     vr,
@@ -418,6 +610,8 @@ def read_dataset(
     parent_encoding: str | MutableSequence[str] = default_encoding,
     specific_tags: list[BaseTag | int] | None = None,
     at_top_level: bool = True,
+    tag_filter: _TagFilter | None = None,
+    _path: str = "",
 ) -> Dataset:
     """Return a :class:`~pydicom.dataset.Dataset` instance containing the next
     dataset in the file.
@@ -447,6 +641,12 @@ def read_dataset(
     at_top_level: bool
         If dataset is top level (not within a sequence).
         Used to turn off explicit VR heuristic within sequences
+    tag_filter : _TagFilter, optional
+        Internal filter used for nested tag path selection, see
+        :func:`dcmread` for parameter info. Mutually exclusive with
+        `specific_tags`.
+    _path : str
+        Tag path of the dataset being read, used for error reporting.
 
     Returns
     -------
@@ -474,16 +674,37 @@ def read_dataset(
         defer_size,
         parent_encoding,
         specific_tags,
+        tag_filter=tag_filter,
+        _path=_path,
+        _end_tell=(
+            fp_start + bytelength
+            if tag_filter is not None and bytelength is not None
+            else None
+        ),
     )
     try:
         if bytelength is None:
-            raw_data_elements = {e.tag: e for e in de_gen}
+            if tag_filter is None:
+                raw_data_elements = {e.tag: e for e in de_gen}
+            else:
+                # collect element by element so that elements read before
+                #   an UnexpectedEOFError is raised are not lost
+                for element in de_gen:
+                    raw_data_elements[element.tag] = element
         else:
             while fp_tell() - fp_start < bytelength:
                 raw_data_element = next(de_gen)
                 raw_data_elements[raw_data_element.tag] = raw_data_element
     except StopIteration:
         pass
+    except UnexpectedEOFError as exc:
+        # a clean end of file at the top level is a normal termination
+        #   of reading; an error carrying a path always comes from a
+        #   nested context and must be propagated
+        if exc.path or not (
+            at_top_level and bytelength is None and exc.at_element_boundary
+        ):
+            raise
     except EOFError as details:
         if config.settings.reading_validation_mode == config.RAISE:
             raise
@@ -493,14 +714,28 @@ def read_dataset(
     except NotImplementedError as details:
         logger.error(details)
 
+    if (
+        tag_filter is not None
+        and bytelength is not None
+        and stop_when is None
+        and fp_tell() - fp_start < bytelength
+    ):
+        raise UnexpectedEOFError(_path, fp_tell())
+
     encoding: str | MutableSequence[str]
     if 0x00080005 in raw_data_elements:
         raw_elem = cast(RawDataElement, raw_data_elements[BaseTag(0x00080005)])
         elem = convert_raw_data_element(raw_elem)
         char_set = cast(str | MutableSequence[str] | None, elem.value)
-        # avoid converting the raw data element again
-        raw_data_elements[BaseTag(0x00080005)] = elem
         encoding = convert_encodings(char_set)  # -> List[str]
+        if tag_filter is None or 0x00080005 in tag_filter.tags:
+            # avoid converting the raw data element again
+            raw_data_elements[BaseTag(0x00080005)] = elem
+        else:
+            # (0008,0005) Specific Character Set is needed internally to
+            #   decode text values, but was not requested - don't include
+            #   it in the returned dataset
+            del raw_data_elements[BaseTag(0x00080005)]
     else:
         encoding = parent_encoding  # -> str | MutableSequence[str]
 
@@ -615,6 +850,173 @@ def read_sequence_item(
 
     ds.seq_item_tell = seq_item_tell
     return ds
+
+
+_EMPTY_FILTER = _TagFilter()
+
+
+def _skip_undefined_length_value(fp: BinaryIO, is_little_endian: bool) -> None:
+    """Skip over an undefined length non-sequence value (e.g. encapsulated
+    data) without reading the fragment payloads into memory.
+
+    ``fp`` shall be positioned directly after the element header. On return
+    it is positioned directly after the Sequence Delimitation Item.
+    """
+    endian_chr = "><"[is_little_endian]
+    header_unpack = Struct(f"{endian_chr}HHL").unpack
+    fp_read, fp_seek, fp_tell = fp.read, fp.seek, fp.tell
+    while True:
+        start = fp_tell()
+        bytes_read = fp_read(8)
+        if len(bytes_read) < 8:
+            raise EOFError(f"Unexpected end of file at offset 0x{start:08X}")
+        group, elem, length = header_unpack(bytes_read)
+        if group == 0xFFFE and elem == 0xE0DD:  # Sequence Delimitation Item
+            return
+        # fragments always have a defined length - seek past the payload
+        fp_seek(fp_tell() + length)
+
+
+def _skip_dataset(fp: BinaryIO, is_implicit_VR: bool, is_little_endian: bool) -> None:
+    """Skip over all data elements up to and including the next Item
+    Delimitation Item without reading element values into memory."""
+    de_gen = data_element_generator(
+        fp, is_implicit_VR, is_little_endian, tag_filter=_EMPTY_FILTER
+    )
+    for _ in de_gen:
+        pass
+
+
+def _skip_undefined_length_sequence(
+    fp: BinaryIO, is_implicit_VR: bool, is_little_endian: bool
+) -> None:
+    """Skip over the items of an undefined length sequence without reading
+    their content, stopping after the Sequence Delimitation Item.
+
+    ``fp`` shall be positioned directly after the sequence header. Item and
+    delimitation item headers are parsed explicitly - the end of the
+    sequence is determined from the delimiter tags, not by searching for
+    byte patterns within the content.
+    """
+    endian_chr = "><"[is_little_endian]
+    header_unpack = Struct(f"{endian_chr}HHL").unpack
+    fp_read, fp_seek, fp_tell = fp.read, fp.seek, fp.tell
+    while True:
+        start = fp_tell()
+        bytes_read = fp_read(8)
+        if len(bytes_read) < 8:
+            raise EOFError(f"Unexpected end of file at offset 0x{start:08X}")
+        group, elem, length = header_unpack(bytes_read)
+        tag = group << 16 | elem
+        if tag == 0xFFFEE0DD:  # Sequence Delimitation Item
+            return
+        # otherwise an Item (FFFE,E000)
+        if length != 0xFFFFFFFF:
+            fp_seek(fp_tell() + length)
+        else:
+            # undefined length item - skip its elements up to the Item
+            #   Delimitation Item
+            _skip_dataset(fp, is_implicit_VR, is_little_endian)
+
+
+def read_sequence_filtered(
+    fp: BinaryIO,
+    is_implicit_VR: bool,
+    is_little_endian: bool,
+    bytelength: int,
+    encoding: str | MutableSequence[str],
+    filters: list[tuple[int | None, _TagFilter]],
+    path: str = "",
+) -> Sequence:
+    """Read a sequence, returning only the selected sub-elements of the
+    selected items, without reading unwanted values into memory.
+
+    Parameters
+    ----------
+    fp : file-like
+        The file-like to read from, positioned directly after the sequence
+        header.
+    is_implicit_VR : bool
+        ``True`` if the data is encoded as implicit VR, ``False`` otherwise.
+    is_little_endian : bool
+        ``True`` if the data is encoded as little endian, ``False``
+        otherwise.
+    bytelength : int
+        The length of the sequence value in bytes, or ``0xFFFFFFFF`` for
+        undefined length.
+    encoding : str | MutableSequence[str]
+        The character encoding of the parent dataset.
+    filters : list of (int or None, _TagFilter)
+        (item selector, sub-filter) pairs; a selector of ``None`` matches
+        all items, an :class:`int` matches only that item index.
+    path : str
+        Tag path of the sequence, used for error reporting.
+
+    Returns
+    -------
+    Sequence
+        A sequence of datasets containing only the selected sub-elements,
+        in the original item order. Items not matched by any selector are
+        omitted.
+    """
+    seq: list[Dataset] = []  # use builtin list to start for speed
+    is_undefined_length = bytelength == 0xFFFFFFFF
+    if is_undefined_length:
+        bytelength = 0
+
+    endian_chr = "><"[is_little_endian]
+    header_unpack = Struct(f"{endian_chr}HHL").unpack
+    fp_read, fp_seek, fp_tell = fp.read, fp.seek, fp.tell
+    fp_start = fp_tell()
+    index = 0
+    while (not bytelength) or (fp_tell() - fp_start < bytelength):
+        item_tell = fp_tell()
+        bytes_read = fp_read(8)
+        if len(bytes_read) < 8:
+            raise UnexpectedEOFError(path, item_tell)
+        group, elem, length = header_unpack(bytes_read)
+        tag = group << 16 | elem
+        if tag == 0xFFFEE0DD:  # Sequence Delimitation Item
+            break
+        if tag != 0xFFFEE000 and config.debugging:
+            logger.warning(
+                f"Expected sequence item with tag {ItemTag} at file "
+                f"position 0x{item_tell:X}"
+            )
+
+        item_path = f"{path}[{index}]"
+        matching = [
+            sub for selector, sub in filters if selector is None or selector == index
+        ]
+        if matching:
+            ds = read_dataset(
+                fp,
+                is_implicit_VR,
+                is_little_endian,
+                bytelength=None if length == 0xFFFFFFFF else length,
+                parent_encoding=encoding,
+                tag_filter=_merged_filter(matching),
+                at_top_level=False,
+                _path=item_path,
+            )
+            ds.is_undefined_length_sequence_item = length == 0xFFFFFFFF
+            ds.seq_item_tell = item_tell
+            ds.file_tell = item_tell
+            seq.append(ds)
+        elif length != 0xFFFFFFFF:
+            # item not selected - seek past its content
+            fp_seek(fp_tell() + length)
+        else:
+            # undefined length item not selected - skip its elements
+            try:
+                _skip_dataset(fp, is_implicit_VR, is_little_endian)
+            except EOFError:
+                raise UnexpectedEOFError(item_path, fp_tell()) from None
+        index += 1
+
+    sequence = Sequence(seq)
+    sequence.is_undefined_length = is_undefined_length
+    return sequence
 
 
 def _read_command_set_elements(fp: BinaryIO) -> Dataset:
@@ -807,6 +1209,7 @@ def read_partial(
     defer_size: int | str | float | None = None,
     force: bool = False,
     specific_tags: list[BaseTag | int] | None = None,
+    tag_filter: _TagFilter | None = None,
 ) -> FileDataset:
     """Parse a DICOM file until a condition is met.
 
@@ -822,6 +1225,9 @@ def read_partial(
         See :func:`dcmread` for parameter info.
     specific_tags : list or None
         See :func:`dcmread` for parameter info.
+    tag_filter : _TagFilter or None
+        Internal filter used for nested tag path selection, see
+        :func:`dcmread` for parameter info.
 
     Notes
     -----
@@ -933,7 +1339,10 @@ def read_partial(
             stop_when=stop_when,
             defer_size=defer_size,
             specific_tags=specific_tags,
+            tag_filter=tag_filter,
         )
+    except UnexpectedEOFError:
+        raise
     except EOFError:
         if config.settings.reading_validation_mode == config.RAISE:
             raise
@@ -961,7 +1370,7 @@ def dcmread(
     defer_size: str | int | float | None = None,
     stop_before_pixels: bool = False,
     force: bool = False,
-    specific_tags: TagListType | None = None,
+    specific_tags: TagListType | list[tuple[Any, ...]] | None = None,
 ) -> FileDataset:
     """Read and parse a DICOM dataset stored in the DICOM File Format.
 
@@ -1017,6 +1426,20 @@ def dcmread(
         *Specific Character Set* is always returned if present - this ensures
         correct decoding of returned text values.
 
+        Nested tag paths may be used to read only selected elements within
+        the items of a sequence without reading the remaining (potentially
+        large) content of the sequence into memory. A tag path is a tuple
+        of alternating tags and item selectors ending with a leaf tag, e.g.
+        ``("ReferencedImageSequence", "*", "ReferencedSOPInstanceUID")``
+        selects (0008,1155) *Referenced SOP Instance UID* in every item of
+        (0008,1140) *Referenced Image Sequence*. An item selector is either
+        a non-negative :class:`int` (the index of a single item) or ``"*"``
+        (all items, returned in their original order). Paths may be nested
+        deeper by adding further ``(sequence tag, item selector)`` pairs.
+        When tag paths are used, (0008,0005) *Specific Character Set* is
+        still read internally wherever it is needed for correct decoding,
+        but is only included in the result if explicitly requested.
+
     Returns
     -------
     FileDataset
@@ -1070,8 +1493,27 @@ def dcmread(
             logger.debug("Caller passed file name")
         logger.debug("-" * 80)
 
+    tag_filter = None
     if specific_tags:
-        specific_tags = [Tag(t) for t in specific_tags]
+        flat_tags: list[Any] = []
+        tag_paths: list[tuple[Any, ...]] = []
+        for entry in specific_tags:
+            if isinstance(entry, tuple | list) and len(entry) >= 3:
+                tag_paths.append(tuple(entry))
+            else:
+                flat_tags.append(entry)
+        specific_tags = [Tag(t) for t in flat_tags]
+        if tag_paths:
+            tag_filter = _TagFilter()
+            for t in specific_tags:
+                tag_filter.tags.add(int(t))
+            for path in tag_paths:
+                _add_tag_path(tag_filter, path)
+            # a fully requested sequence takes precedence over nested
+            #   paths into the same sequence
+            for tag in tag_filter.tags:
+                tag_filter.sequences.pop(tag, None)
+            specific_tags = None
 
     specific_tags = cast(list[BaseTag | int] | None, specific_tags)
 
@@ -1086,6 +1528,7 @@ def dcmread(
             defer_size=size_in_bytes(defer_size),
             force=force,
             specific_tags=specific_tags,
+            tag_filter=tag_filter,
         )
     finally:
         if not caller_owns_file:

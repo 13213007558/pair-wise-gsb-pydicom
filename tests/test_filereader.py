@@ -25,6 +25,7 @@ from pydicom.filereader import (
     read_dataset,
     data_element_generator,
     read_file_meta_info,
+    UnexpectedEOFError,
 )
 from pydicom.dataelem import DataElement, convert_raw_data_element
 from pydicom.errors import InvalidDicomError
@@ -1027,6 +1028,358 @@ class TestReader:
 
         assert ds.file_meta.TransferSyntaxUID == uid
         assert ds.original_encoding == (True, True)
+
+
+class TrackingIO(BytesIO):
+    """A BytesIO that records read and seek operations."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.reads = []  # list of (offset, length)
+        self.seeks = []  # list of (offset, whence)
+
+    def read(self, size=-1):
+        data = super().read(size)
+        self.reads.append((self.tell() - len(data), len(data)))
+        return data
+
+    def seek(self, offset, whence=0):
+        self.seeks.append((offset, whence))
+        return super().seek(offset, whence)
+
+
+def _build_tag_path_file(transfer_syntax, undefined_length=False):
+    """Return the bytes of a DICOM file containing nested sequences
+    with small elements adjacent to large binary values."""
+    file_meta = Dataset()
+    file_meta.MediaStorageSOPClassUID = "1.2.3.4"
+    file_meta.MediaStorageSOPInstanceUID = "1.2.3.4.5"
+    file_meta.TransferSyntaxUID = transfer_syntax
+    file_meta.ImplementationClassUID = "1.2.3.4.5.6"
+
+    ds = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
+    ds.is_little_endian = True
+    ds.is_implicit_VR = transfer_syntax == ImplicitVRLittleEndian
+    ds.PatientName = "Doe^John"
+    ds.PatientID = "123456"
+
+    items = []
+    for i in range(3):
+        item = Dataset()
+        item.ReferencedSOPClassUID = "1.2.840.10008.5.1.4.1.1.2"
+        item.ReferencedSOPInstanceUID = f"1.2.3.4.5.{i}"
+        # large value adjacent to the small selectable elements
+        item[0x00431011] = DataElement(0x00431011, "OB", bytes([i + 1]) * 60000)
+        nested = Dataset()
+        nested.TextValue = f"nested-{i}"
+        nested[0x00431012] = DataElement(0x00431012, "OB", bytes([7]) * 40000)
+        if undefined_length:
+            nested.is_undefined_length_sequence_item = True
+        nested_seq = DataElement(0x0040A730, "SQ", Sequence([nested]))
+        if undefined_length:
+            nested_seq.is_undefined_length = True
+        item[0x0040A730] = nested_seq
+        if undefined_length:
+            item.is_undefined_length_sequence_item = True
+        items.append(item)
+
+    seq_elem = DataElement(0x00081140, "SQ", Sequence(items))
+    if undefined_length:
+        seq_elem.is_undefined_length = True
+    ds[0x00081140] = seq_elem
+    # large top-level value following the sequence
+    ds[0x00431013] = DataElement(0x00431013, "OB", bytes([9]) * 50000)
+
+    buffer = BytesIO()
+    ds.save_as(buffer, enforce_file_format=True)
+    return buffer.getvalue()
+
+
+def _simplify(ds):
+    """Return a dict of tag to value, converting sequences recursively."""
+    out = {}
+    for elem in ds:
+        if elem.VR == "SQ":
+            out[elem.tag] = [_simplify(item) for item in elem.value]
+        else:
+            out[elem.tag] = elem.value
+    return out
+
+
+def _project(ds, paths):
+    """Manually project a fully read dataset for the given tag paths."""
+    out = {}
+    by_tag = {}
+    for path in paths:
+        by_tag.setdefault(Tag(path[0]), []).append(path)
+    for tag, tag_paths in by_tag.items():
+        if tag not in ds:
+            continue
+        elem = ds[tag]
+        if any(len(path) == 1 for path in tag_paths):
+            out[tag] = (
+                [_simplify(item) for item in elem.value]
+                if elem.VR == "SQ"
+                else elem.value
+            )
+            continue
+        # merge the projections of all paths into the same sequence,
+        # keeping the original item order
+        items = {}
+        for path in tag_paths:
+            selector = path[1]
+            for index, item in enumerate(elem.value):
+                if selector not in ("*", index):
+                    continue
+                items.setdefault(index, {}).update(_project(item, [path[2:]]))
+        out[tag] = [items[index] for index in sorted(items)]
+    return out
+
+
+class TestSpecificTagPaths:
+    """Tests for nested tag path selection in dcmread(specific_tags=...)."""
+
+    paths = [
+        ("PatientID",),
+        ("ReferencedImageSequence", "*", "ReferencedSOPInstanceUID"),
+        ("ReferencedImageSequence", 1, "ContentSequence", 0, "TextValue"),
+    ]
+    specific_tags = [
+        "PatientID",
+        ("ReferencedImageSequence", "*", "ReferencedSOPInstanceUID"),
+        ("ReferencedImageSequence", 1, "ContentSequence", 0, "TextValue"),
+    ]
+
+    @pytest.mark.parametrize(
+        "transfer_syntax", [ExplicitVRLittleEndian, ImplicitVRLittleEndian]
+    )
+    @pytest.mark.parametrize("undefined_length", [False, True])
+    def test_matches_full_read_projection(self, transfer_syntax, undefined_length):
+        """Selective reading matches a full read followed by manual
+        projection, for explicit and implicit VR and for sequences and
+        items with undefined length."""
+        data = _build_tag_path_file(transfer_syntax, undefined_length)
+        full = dcmread(BytesIO(data))
+        selected = dcmread(BytesIO(data), specific_tags=self.specific_tags)
+        assert _simplify(selected) == _project(full, self.paths)
+        # (0008,0005) Specific Character Set is not requested and the test
+        # file does not contain it, so the result holds exactly the
+        # requested tags
+        assert set(selected.keys()) == {
+            Tag(0x00100020),
+            Tag(0x00081140),
+        }
+
+    @pytest.mark.parametrize("undefined_length", [False, True])
+    def test_item_order_preserved(self, undefined_length):
+        """All-items selection keeps the original item order."""
+        data = _build_tag_path_file(ExplicitVRLittleEndian, undefined_length)
+        ds = dcmread(
+            BytesIO(data),
+            specific_tags=[
+                ("ReferencedImageSequence", "*", "ReferencedSOPInstanceUID")
+            ],
+        )
+        uids = [item.ReferencedSOPInstanceUID for item in ds.ReferencedImageSequence]
+        assert uids == ["1.2.3.4.5.0", "1.2.3.4.5.1", "1.2.3.4.5.2"]
+
+    @pytest.mark.parametrize("undefined_length", [False, True])
+    def test_single_item_index(self, undefined_length):
+        """Only the item with the selected index is returned."""
+        data = _build_tag_path_file(ExplicitVRLittleEndian, undefined_length)
+        ds = dcmread(
+            BytesIO(data),
+            specific_tags=[("ReferencedImageSequence", 1, "ReferencedSOPInstanceUID")],
+        )
+        assert len(ds.ReferencedImageSequence) == 1
+        item = ds.ReferencedImageSequence[0]
+        assert item.ReferencedSOPInstanceUID == "1.2.3.4.5.1"
+        assert list(item.keys()) == [Tag(0x00081155)]
+
+    def test_item_index_out_of_range(self):
+        """An index beyond the last item returns an empty sequence."""
+        data = _build_tag_path_file(ExplicitVRLittleEndian)
+        ds = dcmread(
+            BytesIO(data),
+            specific_tags=[("ReferencedImageSequence", 5, "ReferencedSOPInstanceUID")],
+        )
+        assert len(ds.ReferencedImageSequence) == 0
+
+    def test_large_values_are_not_read(self):
+        """Selecting small elements does not read adjacent large values:
+        the byte ranges of large values are seeked over, never read."""
+        data = _build_tag_path_file(ExplicitVRLittleEndian)
+
+        # locate the byte ranges of the large values in the file
+        large_ranges = []
+        for pattern, length in [
+            (1, 60000),
+            (2, 60000),
+            (3, 60000),
+            (7, 40000),
+            (9, 50000),
+        ]:
+            start = 0
+            while (offset := data.find(bytes([pattern]) * 1000, start)) != -1:
+                large_ranges.append((offset, length))
+                start = offset + length
+        # sanity check: all 7 large values were found
+        assert len(large_ranges) == 7
+
+        # a full read does read large values into memory
+        full_fp = TrackingIO(data)
+        dcmread(full_fp)
+        assert any(length >= 10000 for _, length in full_fp.reads)
+
+        fp = TrackingIO(data)
+        ds = dcmread(fp, specific_tags=self.specific_tags)
+        assert ds.ReferencedImageSequence[0].ReferencedSOPInstanceUID == ("1.2.3.4.5.0")
+        # no large block of bytes was read into memory
+        assert not any(length >= 10000 for _, length in fp.reads)
+        # no read overlaps a byte range that holds a large value
+        for offset, length in fp.reads:
+            for large_offset, large_length in large_ranges:
+                assert (
+                    offset + length <= large_offset
+                    or offset >= large_offset + large_length
+                )
+        # the unwanted values were skipped by seeking
+        assert fp.seeks
+
+    def test_charset_used_internally_but_not_returned(self):
+        """(0008,0005) Specific Character Set is read internally where
+        needed to decode text, but is only returned if requested."""
+        file_meta = Dataset()
+        file_meta.MediaStorageSOPClassUID = "1.2.3.4"
+        file_meta.MediaStorageSOPInstanceUID = "1.2.3.4.5"
+        file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+        file_meta.ImplementationClassUID = "1.2.3.4.5.6"
+        ds = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
+        ds.is_little_endian = True
+        ds.is_implicit_VR = False
+        ds.SpecificCharacterSet = "ISO_IR 100"
+        ds.PatientID = "123456"
+        item = Dataset()
+        item.SpecificCharacterSet = "ISO_IR 144"
+        item.PatientName = "\u041f\u0440\u0438\u0432\u0435\u0442"
+        ds.ReferencedImageSequence = Sequence([item])
+        buffer = BytesIO()
+        ds.save_as(buffer, enforce_file_format=True)
+        data = buffer.getvalue()
+
+        full = dcmread(BytesIO(data))
+        expected_name = full.ReferencedImageSequence[0].PatientName
+
+        selected = dcmread(
+            BytesIO(data),
+            specific_tags=[("ReferencedImageSequence", "*", "PatientName")],
+        )
+        # not requested - not returned, neither at top level nor in items
+        assert Tag(0x00080005) not in selected
+        selected_item = selected.ReferencedImageSequence[0]
+        assert list(selected_item.keys()) == [Tag(0x00100010)]
+        # but it was available internally to decode the item's text
+        assert selected_item.PatientName == expected_name
+
+        # if requested, it is returned
+        selected = dcmread(
+            BytesIO(data),
+            specific_tags=[("ReferencedImageSequence", "*", "SpecificCharacterSet")],
+        )
+        item = selected.ReferencedImageSequence[0]
+        assert item.SpecificCharacterSet == "ISO_IR 144"
+
+    @pytest.mark.parametrize("undefined_length", [False, True])
+    def test_unexpected_eof_reports_path_and_offset(self, undefined_length):
+        """A truncated file raises UnexpectedEOFError carrying the tag
+        path and the file offset of the failed read."""
+        data = _build_tag_path_file(ExplicitVRLittleEndian, undefined_length)
+        # truncate inside the selected value of the last sequence item
+        uid_offset = data.find(b"1.2.3.4.5.2")
+        assert uid_offset > 0
+        truncated = data[: uid_offset + 5]
+
+        with pytest.raises(UnexpectedEOFError) as exc_info:
+            dcmread(
+                BytesIO(truncated),
+                specific_tags=[
+                    ("ReferencedImageSequence", "*", "ReferencedSOPInstanceUID")
+                ],
+            )
+        exc = exc_info.value
+        assert isinstance(exc, EOFError)
+        expected_path = "ReferencedImageSequence[2].ReferencedSOPInstanceUID"
+        assert exc.path == expected_path
+        assert exc.offset == uid_offset
+        assert exc.path in str(exc)
+        assert format(exc.offset, "X") in str(exc)
+
+    def test_unexpected_eof_missing_delimiter(self):
+        """A truncated undefined length sequence raises UnexpectedEOFError
+        when the delimitation items are missing."""
+        data = _build_tag_path_file(ExplicitVRLittleEndian, undefined_length=True)
+        # truncate inside the large value of the last sequence item - the
+        # Item Delimitation Item at the end of the item is missing
+        ob_offset = data.find(bytes([3]) * 100)
+        assert ob_offset > 0
+        truncated = data[: ob_offset + 30000]
+
+        with pytest.raises(UnexpectedEOFError) as exc_info:
+            dcmread(
+                BytesIO(truncated),
+                specific_tags=[
+                    ("ReferencedImageSequence", "*", "ReferencedSOPInstanceUID")
+                ],
+            )
+        exc = exc_info.value
+        assert exc.path == "ReferencedImageSequence[2]"
+        assert exc.offset >= len(truncated)
+        assert exc.path in str(exc)
+
+    def test_invalid_tag_path(self):
+        """Invalid tag paths raise ValueError."""
+        data = _build_tag_path_file(ExplicitVRLittleEndian)
+        with pytest.raises(ValueError, match="odd number"):
+            dcmread(
+                BytesIO(data),
+                specific_tags=[
+                    (
+                        "ReferencedImageSequence",
+                        "*",
+                        "ReferencedSOPInstanceUID",
+                        "*",
+                    )
+                ],
+            )
+        with pytest.raises(ValueError, match="non-negative integers"):
+            dcmread(
+                BytesIO(data),
+                specific_tags=[
+                    ("ReferencedImageSequence", -1, "ReferencedSOPInstanceUID")
+                ],
+            )
+        with pytest.raises(ValueError, match="non-negative integers"):
+            dcmread(
+                BytesIO(data),
+                specific_tags=[
+                    ("ReferencedImageSequence", "all", "ReferencedSOPInstanceUID")
+                ],
+            )
+
+    def test_full_sequence_request_takes_precedence(self):
+        """Requesting a sequence as a whole wins over nested paths into
+        the same sequence."""
+        data = _build_tag_path_file(ExplicitVRLittleEndian)
+        ds = dcmread(
+            BytesIO(data),
+            specific_tags=[
+                "ReferencedImageSequence",
+                ("ReferencedImageSequence", "*", "ReferencedSOPInstanceUID"),
+            ],
+        )
+        item = ds.ReferencedImageSequence[0]
+        assert Tag(0x00431011) in item  # large value present
+        assert Tag(0x00081155) in item
 
 
 class TestIncorrectVR:
