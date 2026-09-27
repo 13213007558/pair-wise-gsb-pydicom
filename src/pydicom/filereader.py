@@ -306,7 +306,12 @@ def data_element_generator(
                     )
 
                 seq = read_sequence(
-                    fp, is_implicit_VR, is_little_endian, length, encoding
+                    fp,
+                    is_implicit_VR,
+                    is_little_endian,
+                    length,
+                    encoding,
+                    defer_size=defer_size,
                 )
                 if has_tag_set and tag not in tag_set:
                     continue
@@ -516,6 +521,7 @@ def read_sequence(
     bytelength: int,
     encoding: str | MutableSequence[str],
     offset: int = 0,
+    defer_size: str | int | float | None = None,
 ) -> Sequence:
     """Read and return a :class:`~pydicom.sequence.Sequence` -- i.e. a
     :class:`list` of :class:`Datasets<pydicom.dataset.Dataset>`.
@@ -532,7 +538,12 @@ def read_sequence(
         while (not bytelength) or (fp_tell() - fpStart < bytelength):
             file_tell = fp_tell()
             dataset = read_sequence_item(
-                fp, is_implicit_VR, is_little_endian, encoding, offset
+                fp,
+                is_implicit_VR,
+                is_little_endian,
+                encoding,
+                offset,
+                defer_size=defer_size,
             )
             if dataset is None:  # None is returned if hit Sequence Delimiter
                 break
@@ -551,6 +562,7 @@ def read_sequence_item(
     is_little_endian: bool,
     encoding: str | MutableSequence[str],
     offset: int = 0,
+    defer_size: str | int | float | None = None,
 ) -> Dataset | None:
     """Read and return a single :class:`~pydicom.sequence.Sequence` item, i.e.
     a :class:`~pydicom.dataset.Dataset`.
@@ -595,6 +607,7 @@ def read_sequence_item(
             is_implicit_VR,
             is_little_endian,
             bytelength=None,
+            defer_size=defer_size,
             parent_encoding=encoding,
             at_top_level=False,
         )
@@ -605,6 +618,7 @@ def read_sequence_item(
             is_implicit_VR,
             is_little_endian,
             length,
+            defer_size=defer_size,
             parent_encoding=encoding,
             at_top_level=False,
         )
@@ -801,6 +815,31 @@ def _at_pixel_data(tag: BaseTag, vr: str | None, length: int) -> bool:
     return tag in {0x7FE00010, 0x7FE00009, 0x7FE00008}
 
 
+def _set_sequence_item_file_context(ds: FileDataset) -> None:
+    """Recursively propagate the deferred-read file context of `ds` to
+    :class:`~pydicom.dataset.Dataset`s within sequence items.
+
+    This allows deferred elements within sequence items to be read from the
+    original file source when their value is accessed.
+    """
+    context = (ds.filename, ds.buffer, ds.fileobj_type, ds.timestamp)
+
+    def _propagate(item: "Dataset") -> None:
+        item.filename = context[0]  # type: ignore[attr-defined]
+        item.buffer = context[1]  # type: ignore[attr-defined]
+        item.fileobj_type = context[2]  # type: ignore[attr-defined]
+        item.timestamp = context[3]  # type: ignore[attr-defined]
+        for elem in item._dict.values():
+            if elem.VR == "SQ" and isinstance(elem.value, Sequence):
+                for sub_item in elem.value:
+                    _propagate(sub_item)
+
+    for elem in ds._dict.values():
+        if elem.VR == "SQ" and isinstance(elem.value, Sequence):
+            for item in elem.value:
+                _propagate(item)
+
+
 def read_partial(
     fileobj: BinaryIO,
     stop_when: Callable[[BaseTag, str | None, int], bool] | None = None,
@@ -953,6 +992,12 @@ def read_partial(
     )
     # save the originally read transfer syntax properties in the dataset
     ds.set_original_encoding(is_implicit_VR, is_little_endian, dataset._character_set)
+
+    if defer_size is not None:
+        # Allow deferred elements within sequence items to be read from the
+        #   original file source when their value is accessed
+        _set_sequence_item_file_context(ds)
+
     return ds
 
 

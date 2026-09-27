@@ -1690,6 +1690,25 @@ class TestDeferredRead:
         assert isinstance(ds.buffer, DicomBytesIO)
         assert 262144 == len(ds.PixelData)
 
+    def test_deferred_in_sequence_item(self):
+        """Deferred elements within sequence items can be read."""
+        path = get_testdata_file("waveform_ecg.dcm")
+        ds = dcmread(path, defer_size=1024)
+        ds_norm = dcmread(path)
+        for ii in range(2):
+            item = ds.WaveformSequence[ii]
+            expected = ds_norm.WaveformSequence[ii].WaveformData
+            assert expected == item.WaveformData
+
+    def test_deferred_in_sequence_item_filelike(self):
+        """Deferred elements within sequence items work with file-likes."""
+        path = get_testdata_file("waveform_ecg.dcm")
+        ds_norm = dcmread(path)
+        with open(path, "rb") as f:
+            ds = dcmread(f, defer_size=1024)
+            item = ds.WaveformSequence[0]
+            assert ds_norm.WaveformSequence[0].WaveformData == item.WaveformData
+
 
 class TestReadTruncatedFile:
     def testReadFileWithMissingPixelData(self):
