@@ -61,25 +61,30 @@ related *Pixel Data*. The actual offset between them can be determined from
 the top left pixels are aligned and a value of ``[0, 0]`` indicates that the
 overlay pixels start 1 row above and 1 row to the left of the image pixels.
 
-NumPy can be used to modify the pixels, but if the changes are to be saved,
-they must be bit-packed (using something like :func:`~pydicom.pixels.pack_bits`)
-and written back to the correct element:
-
-.. code-block:: python
+NumPy can be used to modify the mask, and the modified mask can be written
+back to the dataset with
+:meth:`Dataset.set_overlay_array()
+<pydicom.dataset.Dataset.set_overlay_array>`, which bit-packs the array,
+handles partial-byte rows and odd-length padding and updates the related
+elements (*Overlay Rows*, *Overlay Columns*, *Number of Frames in Overlay*,
+*Overlay Origin*, *Overlay Bits Allocated* and *Overlay Bit Position*)::
 
   # Add a line
   arr[10, :] = 1
 
-  # Pack the data
-  from pydicom.pixels import pack_bits
-  packed_bytes = pack_bits(arr)
-
-  # Update the element value
-  ds[0x6000, 0x3000].value = packed_bytes
+  # Pack the array and update the overlay elements
+  ds.set_overlay_array(0x6000, arr)
   ds.save_as("temp.dcm")
 
-Some changes may require other DICOM elements to be modified. For example, if
-the overlay data is reduced (e.g. a 512x512 image is resized to 256x256) then
-the corresponding (60xx,0010) *Overlay Rows* and (60xx,0011) *Overlay Columns*
-should be set appropriately. You must explicitly set these yourself as *pydicom*
-does not do so automatically.
+By default the mask is written to the (60xx,3000) *Overlay Data* element.
+The retired convention of embedding overlays in a high bit plane of the
+*Pixel Data* is also supported when explicitly requested, provided the pixel
+data is uncompressed and the bit plane doesn't overlap *Bits Stored*::
+
+  # Embed the overlay at bit position 15 (Bits Stored 12)
+  ds.set_overlay_array(0x6000, arr, bit_plane=15)
+
+For embedded overlays the mask is mapped onto the pixels using the
+``origin`` and ``image_frame_origin`` keyword arguments. Parts of the mask
+that fall outside the pixel matrix raise an exception unless ``crop=True``
+is given, in which case only the overlapping region is written.

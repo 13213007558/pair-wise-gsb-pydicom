@@ -2179,6 +2179,69 @@ class Dataset:  # noqa: PLW1641
 
         return get_overlay_array(self, group)
 
+    def set_overlay_array(
+        self,
+        group: int,
+        arr: "numpy.ndarray",
+        *,
+        origin: tuple[int, int] = (1, 1),
+        image_frame_origin: int = 1,
+        bit_plane: int | None = None,
+        crop: bool = False,
+    ) -> None:
+        """Write an overlay mask to the dataset in `group`.
+
+        Parameters
+        ----------
+        group : int
+            The group number of the overlay data, between ``0x6000`` and
+            ``0x60FF``.
+        arr : numpy.ndarray
+            A binary array shaped as ``(rows, columns)`` or
+            ``(frames, rows, columns)``.
+        origin : tuple[int, int], optional
+            The 1-based ``(row, column)`` origin of the overlay relative to
+            the image pixels (default ``(1, 1)``).
+        image_frame_origin : int, optional
+            The 1-based image frame the first overlay frame applies to
+            (default ``1``).
+        bit_plane : int, optional
+            If given, embed the overlay in this bit plane of the existing
+            *Pixel Data* rather than writing a standalone *Overlay Data*
+            element. Only bit positions at or above *Bits Stored* are
+            accepted and the pixel data must be uncompressed.
+        crop : bool, optional
+            If ``True``, drop parts of an embedded mask that fall outside the
+            pixel matrix instead of raising (default ``False``).
+
+        See Also
+        --------
+        :func:`pydicom.overlays.set_overlay_array`
+        """
+        if group < 0x6000 or group > 0x60FF:
+            raise ValueError(
+                "The group part of the 'Overlay Data' element tag must be "
+                "between 0x6000 and 0x60FF (inclusive)"
+            )
+
+        if not config.have_numpy:
+            raise ImportError(
+                f"NumPy is required for {type(self).__name__}."
+                "set_overlay_array()"
+            )
+
+        from pydicom.overlays import set_overlay_array
+
+        set_overlay_array(
+            self,
+            group,
+            arr,
+            origin=origin,
+            image_frame_origin=image_frame_origin,
+            bit_plane=bit_plane,
+            crop=crop,
+        )
+
     @property
     def pixel_array(self) -> "numpy.ndarray":
         """Return the pixel data as a :class:`numpy.ndarray`.
