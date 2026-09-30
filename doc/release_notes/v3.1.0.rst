@@ -63,6 +63,10 @@ Enhancements
 * Added the :attr:`Dataset.is_decompressed<pydicom.dataset.Dataset.is_decompressed>`
   convenience property for determining whether a dataset uses a compressed transfer
   syntax or not (:issue:`2155`).
+* Added :meth:`Dataset.set_overlay_array<pydicom.dataset.Dataset.set_overlay_array>`
+  and :func:`pydicom.overlays.set_overlay_array` for writing a binary ndarray to
+  a dataset as an overlay plane, either as standalone *Overlay Data* or, when
+  explicitly requested, embedded in a bit plane of the uncompressed *Pixel Data*.
 * Updated UIDs to version 2024d of the DICOM Standard
 * The following UID constants have been added:
 

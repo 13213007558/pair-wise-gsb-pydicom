@@ -2179,6 +2179,68 @@ class Dataset:  # noqa: PLW1641
 
         return get_overlay_array(self, group)
 
+    def set_overlay_array(
+        self,
+        group: int,
+        arr: "numpy.ndarray",
+        *,
+        embedded: bool = False,
+        bit_position: int | None = None,
+        out_of_bounds: str = "raise",
+    ) -> None:
+        """Write a binary :class:`~numpy.ndarray` as the overlay in `group`.
+
+        .. versionadded:: 3.1
+
+        Parameters
+        ----------
+        group : int
+            The group number of the overlay, e.g. ``0x6000``, ``0x6010``,
+            etc.
+        arr : numpy.ndarray
+            The overlay as a binary array (containing only 0s and 1s) shaped
+            ``(rows, columns)`` for a single frame overlay or
+            ``(frames, rows, columns)`` for a multi-frame overlay.
+        embedded : bool, optional
+            If ``False`` (default) then write the overlay as standalone
+            (60xx,3000) *Overlay Data*. If ``True`` then instead write the
+            overlay into the bit plane at `bit_position` of the
+            (7FE0,0010) *Pixel Data* (the retired embedded overlay format).
+            This modifies the image's pixel data and is therefore only
+            performed when explicitly requested.
+        bit_position : int, optional
+            The bit plane of the pixel data to write to when `embedded` is
+            ``True``. If not given then the value of the dataset's existing
+            (60xx,0102) *Overlay Bit Position* element is used.
+        out_of_bounds : str, optional
+            Only used when `embedded` is ``True``. What to do when the
+            overlay, as mapped into the image by (60xx,0050) *Overlay Origin*
+            and (60xx,0051) *Image Frame Origin*, extends outside the image:
+            ``'raise'`` (default) raises an exception, ``'crop'`` crops
+            the overlay to the image bounds.
+        """
+        if group < 0x6000 or group > 0x60FF:
+            raise ValueError(
+                "The group part of the 'Overlay Data' element tag must be "
+                "between 0x6000 and 0x60FF (inclusive)"
+            )
+
+        if not config.have_numpy:
+            raise ImportError(
+                f"NumPy is required for {type(self).__name__}.set_overlay_array()"
+            )
+
+        from pydicom.overlays import set_overlay_array
+
+        set_overlay_array(
+            self,
+            group,
+            arr,
+            embedded=embedded,
+            bit_position=bit_position,
+            out_of_bounds=out_of_bounds,
+        )
+
     @property
     def pixel_array(self) -> "numpy.ndarray":
         """Return the pixel data as a :class:`numpy.ndarray`.
